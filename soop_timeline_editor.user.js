@@ -1,0 +1,656 @@
+// ==UserScript==
+// @name         SOOP 타임라인 에디터
+// @namespace    http://tampermonkey.net/
+// @version      9.5
+// @description  5000자 기준 자동/수동 페이지 분할로 대용량 렉 전면 박멸, Cmd(Alt)+Backspace 즉시 삭제 및 스마트 단축키 커스텀 집대성 버전
+// @author       소해999
+// @match        https://vod.sooplive.com/player/*
+// @match        https://vod.sooplive.co.kr/player/*
+// @match        https://vod.afreecatv.com/player/*
+// @match        https://play.sooplive.com/*
+// @match        https://play.sooplive.co.kr/*
+// @match        https://play.afreecatv.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- 1. OS 및 현재 페이지 모드(VOD / LIVE) 판별 ---
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0 || navigator.userAgent.toUpperCase().indexOf('MAC') >= 0;
+    const mainModKeyText = isMac ? 'Cmd' : 'Alt';
+    const isLiveMode = window.location.href.includes('play.sooplive') || window.location.href.includes('play.afreecatv');
+
+    // --- 2. 단축키 순정 기본값 매핑 정의 부문 ---
+    const defaultHotkeys = {
+        addTimestamp: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'Enter', label: '타임스탬프 추가/완료' },
+        scrollTop: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'ArrowUp', label: '창 맨 위로 스크롤' },
+        scrollBottom: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'ArrowDown', label: '창 맨 아래로 스크롤' },
+        timeMinus1: { ctrl: false, alt: false, shift: false, meta: false, key: '[', label: '선택 항목 -1초 가감' },
+        timePlus1: { ctrl: false, alt: false, shift: false, meta: false, key: ']', label: '선택 항목 +1초 가감' },
+        timeMinus5: { ctrl: false, alt: false, shift: true, meta: false, key: '{', label: '선택 항목 -5초 대폭 가감' },
+        timePlus5: { ctrl: false, alt: false, shift: true, meta: false, key: '}', label: '선택 항목 +5초 대폭 가감' },
+        tabDepth: { ctrl: false, alt: false, shift: false, meta: false, key: 'Tab', label: '들여쓰기 늘리기/줄이기(Shift)' }
+    };
+
+    let hotkeys = GM_getValue('soop_global_hotkeys_v9_5', JSON.parse(JSON.stringify(defaultHotkeys)));
+
+    // --- 3. 🌟 2차원 데이터 레이어 로드 및 구조 마이그레이션 가드 ---
+    let skipSeconds = GM_getValue('soop_global_skip_seconds', 5); 
+    let liveOffsetSeconds = GM_getValue('soop_global_live_offset', 0);
+    const initialEmojiPreset = ["💜", "💛", "💙", "🩷", "🩵", "💚"];
+    let customEmojis = GM_getValue('soop_global_custom_emojis', initialEmojiPreset);
+
+    // 하위 호환 마이그레이션 로직 포함 수집 처리
+    let rawStoredTimelines = GM_getValue('soop_global_timelines', []);
+    let storedPageStructure = GM_getValue('soop_global_page_structure_v9_5', null);
+
+    if (!storedPageStructure) {
+        // 기존 1차원 유저 데이터가 존재할 경우, 유실 없이 1페이지 리스트로 안전하게 흡수 격리
+        storedPageStructure = {
+            currentPageIdx: 0,
+            pages: [
+                { pageName: "댓글 1", list: Array.isArray(rawStoredTimelines) ? rawStoredTimelines : [] }
+            ]
+        };
+        GM_setValue('soop_global_page_structure_v9_5', storedPageStructure);
+    }
+
+    let pageState = storedPageStructure;
+    let activeVideo = null;
+    let lastFocusedInput = null; 
+    let currentFocusedIdx = -1; 
+    let recordingHotkeyAction = null; 
+
+    // 현재 선택된 active 타임라인 리스트 단축 가리키기 포인터
+    function getActiveList() {
+        if (!pageState.pages[pageState.currentPageIdx]) {
+            pageState.currentPageIdx = 0;
+            if (pageState.pages.length === 0) { pageState.pages.push({ pageName: "댓글 1", list: [] }); }
+        }
+        return pageState.pages[pageState.currentPageIdx].list;
+    }
+
+    function savePageState() {
+        GM_setValue('soop_global_page_structure_v9_5', pageState);
+    }
+
+    function formatTime(seconds) {
+        const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
+        const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+        const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+        return `${h}:${m}:${s}`;
+    }
+
+    function initVideoFinder() {
+        const checkInterval = setInterval(() => {
+            const video = document.querySelector('video');
+            if (video && video !== activeVideo) { activeVideo = video; clearInterval(checkInterval); }
+        }, 1000);
+    }
+
+    // 🌟 가공 복사 시 오직 '현재 활성화된 페이지 내부' 텍스트만 조율 연산
+    function buildExportText() {
+        const activeList = getActiveList();
+        return activeList.map(item => {
+            const currentDepth = item.depth || 0;
+            const lines = item.text.split('\n');
+            const prefix = currentDepth === 0 ? '' : 'ㅤ'.repeat(currentDepth - 1) + 'ㄴ';
+            
+            return lines.map((line, idx) => {
+                if (idx === 0) return `${prefix}${item.timeStr} ${line}`;
+                const fallbackSpace = currentDepth === 0 ? 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤ' : 'ㅤ'.repeat(currentDepth - 1) + 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤㅤ';
+                return `${fallbackSpace}${line}`;
+            }).join('\n');
+        }).join('\n');
+    }
+
+    // 🌟 글자 수 카운팅 및 댓글 용량 트래커 연산 대상도 현재 페이지로 격리
+    function calculateTextMetrics() {
+        const textResult = buildExportText();
+        return { length: textResult.length, comments: Math.ceil(textResult.length / 5000) };
+    }
+
+    function updateCounterUI() {
+        const metrics = calculateTextMetrics();
+        counterDisplay.innerText = `${metrics.length}/5000 (현재 페이지)`;
+        renderPageTabs(); 
+    }
+
+    // --- 드래그 유틸 엔진 ---
+    function makeElementDraggable(targetElement, handleClassName, isMainSidebar = false) {
+        const dragHandle = targetElement.querySelector('.' + handleClassName);
+        if (!dragHandle) return;
+
+        if (isMainSidebar) {
+            targetElement.style.right = '20px'; targetElement.style.top = '100px'; targetElement.style.left = 'auto';
+        } else {
+            const modalWidth = 420; const modalHeight = targetElement.offsetHeight || 320; 
+            targetElement.style.left = ((window.innerWidth - modalWidth) / 2) + 'px';
+            targetElement.style.top = ((window.innerHeight - modalHeight) / 2) + 'px';
+        }
+
+        let isDragging = false; let offsetX = 0; let offsetY = 0;
+
+        dragHandle.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            if (isMainSidebar && targetElement.style.right !== 'auto') {
+                const rect = targetElement.getBoundingClientRect();
+                targetElement.style.left = rect.left + 'px'; targetElement.style.top = rect.top + 'px'; targetElement.style.right = 'auto';
+            }
+            offsetX = e.clientX - targetElement.offsetLeft; offsetY = e.clientY - targetElement.offsetTop;
+            document.body.style.userSelect = 'none'; e.preventDefault(); e.stopPropagation();
+        }, true);
+
+        window.addEventListener('mousemove', (e) => { if (!isDragging) return; e.preventDefault(); targetElement.style.left = (e.clientX - offsetX) + 'px'; targetElement.style.top = (e.clientY - offsetY) + 'px'; }, true);
+        window.addEventListener('mouseup', (e) => { if (isDragging) { isDragging = false; document.body.style.userSelect = ''; e.stopPropagation(); } }, true);
+    }
+
+    // --- 4. 스타일 시트 주입 ---
+    GM_addStyle(`
+        #tl-sidebar {
+            position: fixed; width: 390px; height: 620px;
+            background: #18181c; color: #eeeeee; border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6); z-index: 999999;
+            display: flex; flex-direction: column;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            border: 1px solid #2f2f37; transition: height 0.2s, width 0.2s;
+        }
+        #tl-sidebar.minimized { height: 45px !important; width: 240px !important; overflow: hidden; }
+        #tl-sidebar.minimized .tl-page-nav-bar, #tl-sidebar.minimized .tl-toolbar, #tl-sidebar.minimized .tl-body, #tl-sidebar.minimized .tl-footer { display: none !important; }
+        
+        .tl-header { padding: 14px; background: #22222a; border-top-left-radius: 12px; border-top-right-radius: 12px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2f2f37; }
+        .tl-counter { font-size: 11px; color: #00b074; background: rgba(0, 176, 116, 0.1); padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+        .tl-mode-badge { font-size: 10px; padding: 2px 5px; border-radius: 4px; font-weight: bold; margin-left: 4px; }
+        .tl-mode-badge.live { background: #e54444; color: white; }
+        .tl-mode-badge.vod { background: #00b074; color: white; }
+        .tl-header-actions { display: flex; gap: 8px; align-items: center; }
+        .tl-action-icon { cursor: pointer; font-size: 12px; user-select: none; color: #a0a0a5; padding: 2px; }
+        .tl-action-icon:hover { color: #00b074; }
+        
+        /* 🌟 새로 추가된 시원시원한 페이지 네비게이션 스타일 레이어 */
+        .tl-page-nav-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; background: #1a1a22; border-bottom: 1px solid #2f2f37; gap: 6px; }
+        .tl-page-arrow-btn { background: #2a2a34; border: 1px solid #3a3a46; color: #ccc; font-weight: bold; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+        .tl-page-arrow-btn:hover { background: #3a3a46; color: white; }
+        .tl-page-central-display { flex: 1; text-align: center; font-size: 12px; font-weight: bold; color: #00b074; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: #111115; padding: 4px 2px; border-radius: 4px; border: 1px solid #23232a; }
+        .tl-page-add-trigger { background: #00b074; color: white; border: none; font-size: 11px; font-weight: bold; padding: 5px 10px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+        .tl-page-add-trigger:hover { background: #008f5e; }
+
+        .tl-toolbar { padding: 8px 12px; background: #1f1f24; border-bottom: 1px solid #2f2f37; display: flex; align-items: center; min-height: 32px; justify-content: center; }
+        .tl-emoji-container { display: flex; gap: 6px; align-items: center; flex: 1; overflow-x: auto; white-space: nowrap; }
+        .tl-emoji-container::-webkit-scrollbar { height: 4px; }
+        .tl-emoji-container::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 2px; }
+        .tl-emoji-btn { background: #2a2a32; border: 1px solid #3a3a44; color: white; padding: 5px 9px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; display: inline-block; }
+        .tl-emoji-btn:hover { background: #3a3a44; border-color: #00b074; }
+        
+        .tl-time-panel-wrapper { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 6px; }
+        .tl-adjust-group { display: flex; gap: 4px; background: #18181c; padding: 2px; border-radius: 6px; border: 1px solid #2f2f37; }
+        .tl-adj-btn { background: #22222a; border: none; color: #ff9999; font-size: 11px; padding: 4px 6px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .tl-adj-btn.plus { color: #99ff99; }
+        .tl-adj-btn:hover { background: #3a3a44; }
+        .tl-toolbar-btn-group { display: flex; gap: 4px; align-items: center; justify-content: center; flex: 1; }
+        .tl-btn-huge-modify { background: #00b074; color: white; border: none; font-size: 11px; font-weight: bold; padding: 5px 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2); user-select: none; }
+        .tl-btn-huge-modify:hover { background: #008f5e; }
+        .tl-btn-all-select { background: #3a3a44; color: #ffbc00; border: 1px solid #4a4a55; font-size: 11px; font-weight: bold; padding: 4px 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; }
+        .tl-btn-all-select:hover { background: #4a4a55; color: #ffcc22; }
+
+        .tl-body { flex: 1; overflow-y: auto; padding: 12px; }
+        .tl-row { display: flex; align-items: flex-start; margin-bottom: 6px; gap: 6px; padding: 4px; border-radius: 6px; transition: background-color 0.1s; }
+        .tl-depth-0 { padding-left: 4px; }
+        .tl-depth-1 { padding-left: 24px; border-left: 2px dashed #3a3a44; }
+        .tl-depth-2 { padding-left: 44px; border-left: 2px dashed #4a4a55; }
+        .tl-depth-3 { padding-left: 64px; border-left: 2px dashed #00b074; }
+        .tl-row.tl-selected, .tl-row.tl-focused { background-color: rgba(0, 176, 116, 0.15) !important; border-right: 3px solid #00b074; }
+        
+        .tl-checkbox { width: 16px; height: 16px; cursor: pointer; accent-color: #00b074; margin-top: 6px; }
+        .tl-time-btn { background: #00b074; color: white; border: none; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600; white-space: nowrap; user-select: none; margin-top: 2px; }
+        .tl-time-btn:hover { background: #008f5e; }
+        .tl-time-btn.live-btn { background: #4e4e56; cursor: default; }
+
+        .tl-input { 
+            flex: 1; background: #232329; border: 1px solid #3a3a44; color: white; 
+            padding: 5px 10px; border-radius: 6px; font-size: 13px; 
+            resize: none; font-family: inherit; line-height: 1.4; height: 20px; min-height: 20px; overflow-y: hidden;
+        }
+        .tl-input:focus { border-color: #00b074; outline: none; }
+        .tl-del-btn { background: #e54444; border: none; color: white; border-radius: 6px; cursor: pointer; padding: 5px 8px; font-size: 11px; user-select: none; margin-top: 2px; }
+        .tl-del-btn:hover { background: #bd3232; }
+        
+        .tl-footer { padding: 12px; background: #22222a; border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; display: flex; gap: 6px; border-top: 1px solid #2f2f37; align-items: center; }
+        .tl-btn-main { flex: 2; background: #00b074; color: white; border: none; padding: 10px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; }
+        .tl-btn-main:hover { background: #008f5e; }
+        .tl-btn-sub { flex: 1; background: #3a3a44; color: white; border: none; padding: 10px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+        .tl-btn-sub:hover { background: #2f2f37; }
+        .tl-btn-danger { background: #5a2424; color: #ff9999; border: 1px solid #733333; }
+        .tl-btn-danger:hover { background: #bd3232; color: white; }
+        
+        .tl-modal-mask { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.5); z-index: 2000000; }
+        .tledit-popup-box { 
+            position: fixed !important; background: #22222a !important; color: white !important; padding: 20px !important; border-radius: 12px !important; 
+            width: 420px !important; max-height: 85vh !important; display: flex !important; flex-direction: column !important; 
+            border: 1px solid #3a3a44 !important; box-shadow: 0 10px 30px rgba(0,0,0,0.6) !important; z-index: 99999999 !important;
+            right: auto !important; bottom: auto !important;
+        }
+        .tledit-popup-header-area { border-bottom: 1px solid #3a3a44; padding-bottom: 10px; margin-bottom: 15px; user-select: none; position: relative; min-height: 20px; }
+        .tledit-popup-title-text { font-size: 16px; font-weight: bold; color: white; display: inline-block; cursor: move !important; width: 100%; }
+        
+        .tl-emoji-highlight-input { background: rgb(24, 45, 35) !important; border: 1px solid rgb(50, 85, 65) !important; color: #ffffff !important; font-weight: 500 !important; transition: border-color 0.15s, background-color 0.15s; }
+        .tl-emoji-highlight-input:focus { border-color: #00b074 !important; background: rgb(20, 55, 40) !important; outline: none !important; }
+        
+        .tl-help-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; line-height: 1.5; }
+        .tl-help-table th, .tl-help-table td { padding: 8px 10px; border-bottom: 1px solid #3a3a44; text-align: left; color: white; }
+        .tl-help-table th { color: #00b074; font-weight: bold; background: #1c1c24; }
+        .tl-help-kbd { background: #4e4e56; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; box-shadow: 0 1px 2px rgba(0,0,0,0.4); margin-right: 2px; }
+        .tl-kbd-btn-change { background: #00b074; color: white; border: none; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; float: right; }
+        .tl-kbd-btn-change.recording { background: #e54444 !important; animation: tl-blink 1s infinite; }
+        @keyframes tl-blink { 50% { opacity: 0.5; } }
+    `);
+
+    // --- 5. UI 레이아웃 빌드 ---
+    const mainDragWrapper = sidebar; 
+    const bodyContainer = sidebar.querySelector('#tl-body');
+    const dynamicToolbar = sidebar.querySelector('#tl-dynamic-toolbar');
+    const counterDisplay = sidebar.querySelector('#tl-char-counter');
+
+    // 페이지 인디케이터 컨테이너 상단 윗줄 개설 주입
+    const pageNavBar = document.createElement('div');
+    pageNavBar.className = 'tl-page-nav-bar';
+    sidebar.insertBefore(pageNavBar, dynamicToolbar);
+
+    function renderPageTabs() {
+        const totalPages = pageState.pages.length;
+        const displayIndex = pageState.currentPageIdx + 1;
+        pageNavBar.innerHTML = `
+            <button class="tl-page-arrow-btn" id="tl-page-btn-prev">◀</button>
+            <div class="tl-page-central-display">PAGE: ${displayIndex} / ${totalPages}</div>
+            <button class="tl-page-arrow-btn" id="tl-page-btn-next">▶</button>
+            <button class="tl-page-add-trigger" id="tl-page-btn-add">➕ 페이지 추가</button>
+        `;
+
+        pageNavBar.querySelector('#tl-page-btn-prev').addEventListener('click', () => {
+            if (pageState.currentPageIdx > 0) { pageState.currentPageIdx--; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
+        });
+        pageNavBar.querySelector('#tl-page-btn-next').addEventListener('click', () => {
+            if (pageState.currentPageIdx < pageState.pages.length - 1) { pageState.currentPageIdx++; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
+        });
+        pageNavBar.querySelector('#tl-page-btn-add').addEventListener('click', () => {
+            const nextNum = pageState.pages.length + 1;
+            pageState.pages.push({ pageName: `댓글 ${nextNum}`, list: [] });
+            pageState.currentPageIdx = pageState.pages.length - 1;
+            currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
+        });
+    }
+
+    function refreshToolbarUI() {
+        const activeList = getActiveList();
+        const hasChecked = activeList.some(item => item.selected);
+        const isAllChecked = activeList.length > 0 && activeList.every(item => item.selected);
+        dynamicToolbar.innerHTML = '';
+
+        if (hasChecked) {
+            const panelWrapper = document.createElement('div');
+            panelWrapper.className = 'tl-time-panel-wrapper';
+            const toggleSelectText = isAllChecked ? '❌ 전체 해제' : '☑️ 현재페이지 전체선택';
+
+            panelWrapper.innerHTML = `
+                <div class="tl-adjust-group"><button class="tl-adj-btn" id="tl-dyn-m5">-5s</button><button class="tl-adj-btn" id="tl-dyn-m1">-1s</button></div>
+                <div class="tl-toolbar-btn-group">
+                    <button class="tl-btn-huge-modify" id="tl-dyn-huge">⏳ 일괄조정</button>
+                    <button class="tl-btn-all-select" id="tl-dyn-all-toggle">${toggleSelectText}</button>
+                </div>
+                <div class="tl-adjust-group"><button class="tl-adj-btn plus" id="tl-dyn-p1">+1s</button><button class="tl-adj-btn plus" id="tl-dyn-p2">+5s</button></div>
+            `;
+            dynamicToolbar.appendChild(panelWrapper);
+
+            panelWrapper.querySelector('#tl-dyn-m5').addEventListener('click', () => modifyTimelineSeconds(-5));
+            panelWrapper.querySelector('#tl-dyn-m1').addEventListener('click', () => modifyTimelineSeconds(-1));
+            panelWrapper.querySelector('#tl-dyn-p1').addEventListener('click', () => modifyTimelineSeconds(1));
+            panelWrapper.querySelector('#tl-dyn-p2').addEventListener('click', () => modifyTimelineSeconds(5));
+            panelWrapper.querySelector('#tl-dyn-huge').addEventListener('click', () => openHugeModifyModal());
+            panelWrapper.querySelector('#tl-dyn-all-toggle').addEventListener('click', () => {
+                const nextState = !isAllChecked; activeList.forEach(item => item.selected = nextState); render(); refreshToolbarUI();
+            });
+        } else {
+            const emojiContainer = document.createElement('div');
+            emojiContainer.className = 'tl-emoji-container';
+            customEmojis.forEach(text => {
+                const btn = document.createElement('span'); btn.className = 'tl-emoji-btn'; btn.innerText = text; emojiContainer.appendChild(btn);
+            });
+            dynamicToolbar.appendChild(emojiContainer);
+        }
+    }
+
+    function render() {
+        const currentScrollPosition = bodyContainer.scrollTop;
+        const activeList = getActiveList();
+
+        bodyContainer.innerHTML = '';
+        activeList.forEach((item, index) => {
+            const row = document.createElement('div');
+            const isFocused = (index === currentFocusedIdx);
+            row.className = `tl-row tl-depth-${item.depth || 0} ${item.selected ? 'tl-selected' : ''} ${isFocused ? 'tl-focused' : ''}`;
+            row.dataset.index = index;
+            
+            const btnClass = isLiveMode ? 'tl-time-btn live-btn' : 'tl-time-btn';
+            row.innerHTML = `
+                <input type="checkbox" class="tl-checkbox" ${item.selected ? 'checked' : ''}>
+                <button class="${btnClass}" data-time="${item.seconds}">${item.timeStr}</button>
+                <textarea class="tl-input" placeholder="내용 입력...">${item.text}</textarea>
+                <button class="tl-del-btn">X</button>
+            `;
+            bodyContainer.appendChild(row);
+            autoResizeTextarea(row.querySelector('.tl-input'));
+        });
+        
+        savePageState();
+        updateCounterUI();
+        bodyContainer.scrollTop = currentScrollPosition;
+    }
+
+    function modifyTimelineSeconds(delta) {
+        const activeList = getActiveList();
+        activeList.forEach(item => { if (item.selected) { item.seconds = Math.max(0, (item.seconds || 0) + delta); item.timeStr = formatTime(item.seconds); } });
+        activeList.sort((a, b) => a.seconds - b.seconds); render();
+    }
+
+    function openHugeModifyModal() {
+        const activeList = getActiveList();
+        const checkedCount = activeList.filter(item => item.selected).length; if(checkedCount === 0) return;
+        const mask = document.createElement('div'); mask.className = 'tl-modal-mask';
+        const modal = document.createElement('div'); modal.className = 'tledit-popup-box';
+        modal.innerHTML = `
+            <div class="tledit-popup-header-area"><span class="tledit-popup-title-text">⏳ 현재페이지 일괄 조정 (${checkedCount}개)</span></div>
+            <div class="tl-h-input-grid">
+                <select id="tl-h-sign" class="tl-h-select"><option value="plus">+</option><option value="minus">-</option></select>
+                <input type="number" id="tl-h-hr" class="tl-h-time-box" value="0"> 시
+                <input type="number" id="tl-h-mn" class="tl-h-time-box" value="0"> 분
+                <input type="number" id="tl-h-sc" class="tl-h-time-box" value="0"> 초
+            </div>
+            <div class="tl-modal-footer"><button class="tl-btn-sub" id="tl-h-btn-cancel">취소</button><button class="tl-btn-main" id="tl-h-btn-apply">적용</button></div>
+        `;
+        document.body.appendChild(mask); document.body.appendChild(modal);
+        makeElementDraggable(modal, 'tledit-popup-title-text', false);
+        const cleanUp = () => { mask.remove(); modal.remove(); };
+        modal.querySelector('#tl-h-btn-cancel').addEventListener('click', cleanUp);
+        modal.querySelector('#tl-h-btn-apply').addEventListener('click', () => {
+            const sign = modal.querySelector('#tl-h-sign').value;
+            const hr = parseInt(modal.querySelector('#tl-h-hr').value || 0, 10);
+            const mn = parseInt(modal.querySelector('#tl-h-mn').value || 0, 10);
+            const sc = parseInt(modal.querySelector('#tl-h-sc').value || 0, 10);
+            let totalDelta = (hr * 3600) + (mn * 60) + sc; if (sign === 'minus') totalDelta = -totalDelta;
+            activeList.forEach(item => { if (item.selected) { item.seconds = Math.max(0, item.seconds + totalDelta); item.timeStr = formatTime(item.seconds); } });
+            activeList.sort((a, b) => a.seconds - b.seconds); render(); refreshToolbarUI(); cleanUp();
+        });
+    }
+
+    function addTimestamp() {
+        if (!activeVideo) return alert('재생 중인 영상을 찾을 수 없습니다.');
+        
+        // 🌟 성능 증폭 가드: 만약 현재 페이지가 이미 5000 임계점을 돌파해 있다면 강제로 새 자동 페이지를 개설해 파킹
+        const metrics = calculateTextMetrics();
+        if (metrics.length >= 4950) {
+            const nextIndex = pageState.pages.length + 1;
+            pageState.pages.push({ pageName: `댓글 ${nextIndex}`, list: [] });
+            pageState.currentPageIdx = pageState.pages.length - 1;
+        }
+
+        let currentSec = activeVideo.currentTime; let timeStr = formatTime(currentSec);
+        if (isLiveMode) {
+            const liveTimeElement = document.getElementById('time');
+            if (liveTimeElement) {
+                const parts = liveTimeElement.innerText.trim().split(':');
+                if (parts.length === 3) {
+                    let extractedSec = (parseInt(parts[0], 10) * 3600) + (parseInt(parts[1], 10) * 60) + parseInt(parts[2], 10);
+                    currentSec = Math.max(0, extractedSec - liveOffsetSeconds); timeStr = formatTime(currentSec);
+                }
+            }
+        }
+
+        let defaultDepth = 0; const activeList = getActiveList();
+        try {
+            const tempArray = [...activeList, { seconds: currentSec }]; tempArray.sort((a, b) => a.seconds - b.seconds);
+            const virtualIdx = tempArray.findIndex(item => item.seconds === currentSec && !item.timeStr);
+            if (virtualIdx > 0) defaultDepth = tempArray[virtualIdx - 1].depth || 0;
+        } catch(e) {}
+
+        const virtualObject = { seconds: currentSec, timeStr: timeStr, text: '', depth: defaultDepth, selected: false };
+        activeList.push(virtualObject); activeList.sort((a, b) => a.seconds - b.seconds); 
+
+        const foundRealIdx = activeList.findIndex(item => item === virtualObject); currentFocusedIdx = foundRealIdx; 
+        render(); refreshToolbarUI();
+
+        setTimeout(() => {
+            const rows = bodyContainer.querySelectorAll('.tl-row');
+            if (rows[foundRealIdx]) { rows[foundRealIdx].querySelector('.tl-input').focus(); rows[foundRealIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+        }, 50);
+    }
+
+    // --- 6. 이벤트 통합 리스너 설계 레이어 ---
+    dynamicToolbar.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('tl-emoji-btn')) return;
+        const insertText = e.target.innerText; let inputTarget = lastFocusedInput;
+        if (!inputTarget || !document.body.contains(inputTarget)) {
+            const allInputs = bodyContainer.querySelectorAll('.tl-input'); if (allInputs.length > 0) inputTarget = allInputs[allInputs.length - 1];
+        }
+        if (inputTarget) {
+            const startPos = inputTarget.selectionStart; const endPos = inputTarget.selectionEnd; const oldText = inputTarget.value;
+            const newText = oldText.substring(0, startPos) + insertText + oldText.substring(endPos, oldText.length); inputTarget.value = newText;
+            const row = inputTarget.closest('.tl-row');
+            if (row) { getActiveList()[parseInt(row.dataset.index)].text = newText; savePageState(); }
+            updateCounterUI(); inputTarget.focus(); autoResizeTextarea(inputTarget);
+            const newCursorPos = startPos + insertText.length; inputTarget.setSelectionRange(newCursorPos, newCursorPos);
+        }
+    });
+
+    bodyContainer.addEventListener('click', (e) => {
+        const row = e.target.closest('.tl-row'); if (!row) return;
+        const idx = parseInt(row.dataset.index); const activeList = getActiveList();
+
+        if (e.target.classList.contains('tl-checkbox')) {
+            const targetChecked = e.target.checked; const parentDepth = activeList[idx].depth || 0; activeList[idx].selected = targetChecked;
+            for (let i = idx + 1; i < activeList.length; i++) { if ((activeList[i].depth || 0) > parentDepth) activeList[i].selected = targetChecked; else break; }
+            render(); refreshToolbarUI(); return;
+        }
+        if (e.target.classList.contains('tl-time-btn')) { seekToTime(parseFloat(e.target.dataset.time)); return; }
+        if (e.target.classList.contains('tl-del-btn')) { 
+            activeList.splice(idx, 1); if(currentFocusedIdx === idx) currentFocusedIdx = -1; render(); refreshToolbarUI(); return; 
+        }
+    });
+
+    bodyContainer.addEventListener('focusin', (e) => {
+        if (e.target.classList.contains('tl-input')) {
+            lastFocusedInput = e.target; const currentRow = e.target.closest('.tl-row'); const targetIdx = parseInt(currentRow.dataset.index);
+            if (currentFocusedIdx === targetIdx) return;
+            bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
+            currentFocusedIdx = targetIdx; currentRow.classList.add('tl-focused');
+        }
+    });
+
+    bodyContainer.addEventListener('input', (e) => {
+        const row = e.target.closest('.tl-row');
+        if (row && e.target.classList.contains('tl-input')) {
+            getActiveList()[parseInt(row.dataset.index)].text = e.target.value; savePageState(); autoResizeTextarea(e.target); updateCounterUI();
+        }
+    });
+
+    bodyContainer.addEventListener('keydown', (e) => {
+        const row = e.target.closest('.tl-row'); if (!row) return;
+        const currentIdx = parseInt(row.dataset.index); const activeList = getActiveList();
+
+        if (e.key === 'Tab' && hotkeys.tabDepth.key === 'Tab' && !hotkeys.tabDepth.ctrl && !hotkeys.tabDepth.alt && !hotkeys.tabDepth.meta) {
+            e.preventDefault(); e.stopPropagation();
+            let targetIndices = activeList.map((item, idx) => item.selected ? idx : -1).filter(idx => idx !== -1);
+            if (targetIndices.length === 0) targetIndices = [currentIdx];
+            targetIndices.forEach(idx => { let d = activeList[idx].depth || 0; activeList[idx].depth = e.shiftKey ? Math.max(0, d - 1) : Math.min(3, d + 1); });
+            const savedInputVal = e.target.value; const savedCursorPos = e.target.selectionStart; render();
+            const targetInput = bodyContainer.querySelectorAll('.tl-row')[currentIdx].querySelector('.tl-input');
+            targetInput.focus(); targetInput.value = savedInputVal; targetInput.setSelectionRange(savedCursorPos, savedCursorPos); return;
+        }
+
+        if (e.target.classList.contains('tl-input')) {
+            const isMainModifier = isMac ? (e.metaKey || e.keyCode === 91 || e.keyCode === 93) : e.altKey;
+            
+            // 🌟 대망의 추가 요청 반영: 수정 단계창 내부에서 Cmd(Alt) + Backspace(지우기) 클릭 시 원터치 파괴폭파 기능 가동
+            if (isMainModifier && (e.key === 'Backspace' || e.keyCode === 8)) {
+                e.preventDefault(); e.stopPropagation();
+                activeList.splice(currentIdx, 1); // 현재 수정 중인 라인 즉시 소멸
+                currentFocusedIdx = -1; render(); refreshToolbarUI();
+                if (activeVideo) activeVideo.focus(); // 소멸 즉시 비디오 화면 포커스 정상 사수 반환
+                return;
+            }
+
+            const matchAddKey = (e.key.toLowerCase() === hotkeys.addTimestamp.key.toLowerCase()) && 
+                                (e.ctrlKey === hotkeys.addTimestamp.ctrl) && (e.shiftKey === hotkeys.addTimestamp.shift) && 
+                                (isMac ? (e.metaKey === hotkeys.addTimestamp.meta) : (e.altKey === hotkeys.addTimestamp.alt));
+
+            if (matchAddKey) {
+                e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; 
+                bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
+                e.target.blur(); if (activeVideo) activeVideo.focus(); return;
+            }
+            if (e.key === 'Enter' || e.keyCode === 13) { e.stopPropagation(); setTimeout(() => autoResizeTextarea(e.target), 10); return; }
+            if (e.key === 'Escape' || e.keyCode === 27) {
+                e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
+                bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
+                e.target.blur(); if (activeVideo) activeVideo.focus(); return;
+            }
+            e.stopPropagation(); 
+        }
+    });
+
+    document.getElementById('tl-btn-clear').addEventListener('click', () => {
+        const activeList = getActiveList(); if (activeList.length === 0) return alert('삭제할 데이터가 없습니다.');
+        if (confirm(`⚠️ 현재 페이지(${pageState.currentPageIdx + 1}번 탭)의 타임라인 데이터만 삭제됩니다. 정말 삭제하시겠습니까?`)) { 
+            pageState.pages[pageState.currentPageIdx].list = []; currentFocusedIdx = -1; render(); refreshToolbarUI(); 
+        }
+    });
+
+    document.getElementById('tl-btn-export').addEventListener('click', () => {
+        const activeList = getActiveList(); if (activeList.length === 0) return alert('작성된 데이터가 없습니다.');
+        const textResult = buildExportText(); navigator.clipboard.writeText(textResult).then(() => alert(`현재 ${pageState.currentPageIdx + 1}페이지 복사 완료!`));
+    });
+
+    document.getElementById('tl-btn-import').addEventListener('click', () => {
+        const rawText = prompt('타임라인 텍스트를 붙여넣으세요 (현재 탭에 추가 정렬됩니다):'); if (!rawText) return;
+        const lines = rawText.split('\n'); const imported = getActiveList();
+        lines.forEach(line => {
+            const match = line.match(/(?:(\d{1,2}):)?(\d{2}):(\d{2})/);
+            if (match) {
+                const timeStr = match[0]; const totalSeconds = (match[1] ? parseInt(match[1])*3600 : 0) + parseInt(match[2])*60 + parseInt(match[3]);
+                const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
+                imported.push({ 
+                    seconds: totalSeconds, timeStr: timeStr.padStart(8, '0'), 
+                    text: line.replace(/^ㅤ*ㄴ*/, '').trim().replace(/\[?\s*(?:(?:\d{1,2}):)?(?:\d{2}):(?:\d{2})\s*\]?/, '').trim(), 
+                    depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0), selected: false 
+                });
+            }
+        });
+        if (imported.length > 0) { currentFocusedIdx = -1; pageState.pages[pageState.currentPageIdx].list = imported.sort((a, b) => a.seconds - b.seconds); render(); refreshToolbarUI(); }
+    });
+
+    // 도움말 단축키 커스텀 마운터 팝업
+    function openHelpAndHotkeyModal() {
+        const mask = document.createElement('div'); mask.className = 'tl-modal-mask'; mask.id = 'tl-help-mask';
+        const modal = document.createElement('div'); modal.className = 'tledit-popup-box'; modal.id = 'tl-help-modal';
+        let rowsHtml = '';
+        for (const actionKey in hotkeys) {
+            const action = hotkeys[actionKey]; const currentKeyStr = getHotkeyString(action);
+            rowsHtml += `<tr data-action="${actionKey}"><td style="font-weight:600; color:#eee;">${action.label}</td><td><kbd class="tl-help-kbd" id="kbd-text-${actionKey}">${currentKeyStr}</kbd></td><td style="text-align:right;"><button class="tl-kbd-btn-change" data-action="${actionKey}">[ 변경 ]</button></td></tr>`;
+        }
+        modal.innerHTML = `
+            <div class="tledit-popup-header-area"><span class="tledit-popup-title-text" style="width:60%;">❓ 단축키 커스텀 & 가이드</span><button class="tl-btn-sub" id="tl-kbd-btn-reset" style="padding: 4px 10px; font-size:11px; float:right;">🔄 전체 기본값 복원</button></div>
+            <div style="flex:1; overflow-y:auto; font-size:13px; color:#ddd; padding-right:4px;">
+                <table class="tl-help-table"><thead><tr><th>기능 종류</th><th>연동 단축키</th><th style="text-align:right;">편집</th></tr></thead><tbody id="tl-hotkey-table-body">${rowsHtml}</tbody></table>
+                <p style="margin-top:10px; font-size:12px; color:#00b074; font-weight:bold;">💡 [신규 전용 핫키] 작성 중인 타임라인 라인 즉시 삭제 파괴: <kbd class="tl-help-kbd">${mainModKeyText} + Backspace</kbd></p>
+            </div>
+            <div class="tl-modal-footer"><button class="tl-btn-main" id="tl-help-close-btn" style="padding: 8px 24px;">닫기</button></div>
+        `;
+        document.body.appendChild(mask); document.body.appendChild(modal); makeElementDraggable(modal, 'tledit-popup-title-text', false);
+        const cleanUpHelp = () => { recordingHotkeyAction = null; mask.remove(); modal.remove(); };
+        modal.querySelector('#tl-help-close-btn').addEventListener('click', cleanUpHelp);
+        modal.querySelector('#tl-kbd-btn-reset').addEventListener('click', () => {
+            if(confirm('⚠️ 모든 커스텀 설정을 초기 스펙 상태로 되돌리시겠습니까?')) { hotkeys = JSON.parse(JSON.stringify(defaultHotkeys)); GM_setValue('soop_global_hotkeys_v9_5', hotkeys); cleanUpHelp(); openHelpAndHotkeyModal(); }
+        });
+        modal.querySelector('#tl-hotkey-table-body').addEventListener('click', (e) => {
+            if (!e.target.classList.contains('tl-kbd-btn-change')) return; const targetAction = e.target.dataset.action;
+            if (recordingHotkeyAction === targetAction) { recordingHotkeyAction = null; e.target.innerText = '[ 변경 ]'; e.target.classList.remove('recording'); document.getElementById(`kbd-text-${targetAction}`).innerText = getHotkeyString(hotkeys[targetAction]); return; }
+            modal.querySelectorAll('.tl-kbd-btn-change').forEach(btn => { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); });
+            for (const act in hotkeys) { document.getElementById(`kbd-text-${act}`).innerText = getHotkeyString(hotkeys[act]); }
+            recordingHotkeyAction = targetAction; e.target.innerText = '[ 입력중... ]'; e.target.classList.add('recording'); document.getElementById(`kbd-text-${targetAction}`).innerText = '⌨️ 키를 누르세요...';
+        });
+    }
+
+    document.getElementById('tl-btn-help').addEventListener('click', openHelpAndHotkeyModal);
+
+    // 글로벌 핫키 핸들러 계층
+    window.addEventListener('keydown', (e) => {
+        if (recordingHotkeyAction) {
+            e.preventDefault(); e.stopPropagation();
+            if (e.key === 'Escape') {
+                const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${recordingHotkeyAction}"]`);
+                if (btn) { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); }
+                document.getElementById(`kbd-text-${recordingHotkeyAction}`).innerText = getHotkeyString(hotkeys[recordingHotkeyAction]);
+                recordingHotkeyAction = null; return;
+            }
+            if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
+                let tempParts = []; if (e.ctrlKey) tempParts.push('Ctrl'); if (e.altKey) tempParts.push('Alt'); if (e.shiftKey) tempParts.push('Shift'); if (e.metaKey) tempParts.push(isMac ? 'Cmd' : 'Win');
+                document.getElementById(`kbd-text-${recordingHotkeyAction}`).innerText = tempParts.join(' + ') + ' + ...'; return;
+            }
+            const isSingleSymbolKey = /^[^a-zA-Z0-9]$/.test(e.key);
+            if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+                if (recordingHotkeyAction === 'tabDepth' && e.key === 'Tab') {} else if (isSingleSymbolKey) {} else { alert('⚠️ 문자와 방향키, 엔터 등은 숲 단축키 보호를 위해 조합키(Ctrl, Alt, Shift)와 함께 눌러주세요!'); return; }
+            }
+            hotkeys[recordingHotkeyAction] = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key, label: defaultHotkeys[recordingHotkeyAction].label };
+            GM_setValue('soop_global_hotkeys_v9_5', hotkeys); const targetActSaved = recordingHotkeyAction; recordingHotkeyAction = null;
+            const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${targetActSaved}"]`); if (btn) { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); }
+            document.getElementById(`kbd-text-${targetActSaved}`).innerText = getHotkeyString(hotkeys[targetActSaved]); return;
+        }
+
+        const isMainModifier = isMac ? (e.metaKey || e.keyCode === 91 || e.keyCode === 93) : e.altKey;
+
+        if (e.key === 'Escape' || e.keyCode === 27) {
+            let modalClosed = false;
+            const helpMask = document.getElementById('tl-help-mask'), helpModal = document.getElementById('tl-help-modal'); if (helpMask && helpModal) { helpMask.remove(); helpModal.remove(); modalClosed = true; }
+            const hugeMask = document.getElementById('tl-huge-mask'), hugeModal = document.getElementById('tl-huge-modal'); if (hugeMask && hugeModal) { hugeMask.remove(); hugeModal.remove(); modalClosed = true; }
+            const settMask = document.getElementById('tl-sett-mask'), settModal = document.getElementById('tl-sett-modal'); if (settMask && settModal) { if (typeof window.saveTimelineSettingsData === 'function') { window.saveTimelineSettingsData(); } settMask.remove(); settModal.remove(); modalClosed = true; }
+            if (modalClosed) { e.preventDefault(); e.stopPropagation(); return; }
+
+            const activeList = getActiveList(); const hasCheckedItem = activeList.some(item => item.selected);
+            if (hasCheckedItem && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); e.stopPropagation(); activeList.forEach(item => item.selected = false); currentFocusedIdx = -1; render(); refreshToolbarUI(); return; }
+        }
+
+        if (document.getElementById('tl-sett-modal') || document.getElementById('tl-huge-modal')) return;
+
+        const isMatch = (hk) => { return (e.key.toLowerCase() === hk.key.toLowerCase()) && (e.ctrlKey === hk.ctrl) && (e.shiftKey === hk.shift) && (isMac ? (e.metaKey === hk.meta) : (e.altKey === hk.alt)); };
+
+        if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
+            if (isMatch(hotkeys.scrollTop)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+            if (isMatch(hotkeys.scrollBottom)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: bodyContainer.scrollHeight, behavior: 'smooth' }); return; }
+        }
+
+        const isInputFocused = e.target.classList.contains('tl-input'); const activeList = getActiveList();
+        if (isMatch(hotkeys.tabDepth) && isInputFocused) {
+            e.preventDefault(); e.stopPropagation(); const currentIdx = parseInt(e.target.closest('.tl-row').dataset.index); let targetIndices = activeList.map((item, idx) => item.selected ? idx : -1).filter(idx => idx !== -1);
+            if (targetIndices.length === 0) targetIndices = [currentIdx];
+            targetIndices.forEach(idx => { let d = activeList[idx].depth || 0; activeList[idx].depth = e.shiftKey ? Math.max(0, d - 1) : Math.min(3, d + 1); });
+            const val = e.target.value, cursor = e.target.selectionStart; render(); const tInput = bodyContainer.querySelectorAll('.tl-row')[currentIdx].querySelector('.tl-input');
+            tInput.focus(); tInput.value = val; tInput.setSelectionRange(cursor, cursor); return;
+        }
+
+        if (isMatch(hotkeys.addTimestamp)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTimestamp(); } return; }
+
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') { if (e.key === 'Escape' || e.keyCode === 27) { if (currentFocusedIdx !== -1) { e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); return; } } return; }
+
+        if (isMatch(hotkeys.timeMinus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-1); return; }
+        if (isMatch(hotkeys.timePlus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(1); return; }
+        if (isMatch(hotkeys.timeMinus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-5); return; }
+        if (isMatch(hotkeys.timePlus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(5); return; }
+
+        if (e.key === 'ArrowLeft' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(Math.max(0, activeVideo.currentTime - skipSeconds)); return; }
+        if (e.key === 'ArrowRight' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(Math.min(activeVideo.duration, activeVideo.currentTime + skipSeconds)); return; }
+    }, true); 
+
+    initVideoFinder(); refreshToolbarUI(); render();
+})();
