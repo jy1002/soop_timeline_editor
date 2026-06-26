@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOOP 타임라인 에디터
 // @namespace    http://tampermonkey.net/
-// @version      9.5
+// @version      9.10
 // @description  5000자 기준 자동/수동 페이지 분할로 대용량 렉 전면 박멸, Cmd(Alt)+Backspace 즉시 삭제 및 스마트 단축키 커스텀 집대성 버전
 // @author       소해999
 // @match        https://vod.sooplive.com/player/*
@@ -13,6 +13,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      api.m.sooplive.com
 // ==/UserScript==
 
 (function() {
@@ -60,9 +62,15 @@
 
     let pageState = storedPageStructure;
     let activeVideo = null;
-    let lastFocusedInput = null; 
-    let currentFocusedIdx = -1; 
-    let recordingHotkeyAction = null; 
+    let lastFocusedInput = null;
+    let currentFocusedIdx = -1;
+    let recordingHotkeyAction = null;
+
+    // --- 파트 오프셋 상태 ---
+    let partOffsets = [0];
+    let partDurations = [];
+    let currentPartIdx = 0;
+    let pendingSeekAbsSec = null; // 크로스-파트 seek 대기 중인 절대 시간(초)
 
     // 현재 선택된 active 타임라인 리스트 단축 가리키기 포인터
     function getActiveList() {
@@ -84,11 +92,235 @@
         return `${h}:${m}:${s}`;
     }
 
+    function autoResizeTextarea(el) {
+        el.style.height = 'auto';
+        el.style.height = el.scrollHeight + 'px';
+    }
+
+    function getHotkeyString(hk) {
+        const parts = [];
+        if (hk.ctrl) parts.push('Ctrl');
+        if (hk.alt) parts.push(isMac ? 'Option' : 'Alt');
+        if (hk.shift) parts.push('Shift');
+        if (hk.meta) parts.push(isMac ? 'Cmd' : 'Win');
+        parts.push(hk.key === ' ' ? 'Space' : hk.key);
+        return parts.join(' + ');
+    }
+
+    function matchPartByDuration(dur) {
+        if (!dur || isNaN(dur) || partDurations.length === 0) return;
+        let bestIdx = 0, bestDiff = Infinity;
+        for (let i = 0; i < partDurations.length; i++) {
+            const diff = Math.abs(dur - partDurations[i]);
+            if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+        }
+        if (bestDiff >= 10) return;
+        currentPartIdx = bestIdx;
+
+        // 크로스-파트 seek 대기 중이면 처리
+        if (pendingSeekAbsSec === null || !activeVideo) return;
+        const targetIdx = getTargetPartIdx(pendingSeekAbsSec);
+        if (targetIdx === currentPartIdx) {
+            // 목표 파트 도달: 상대 시간으로 seek
+            activeVideo.currentTime = Math.max(0, pendingSeekAbsSec - (partOffsets[currentPartIdx] || 0));
+            pendingSeekAbsSec = null;
+        } else if (targetIdx > currentPartIdx) {
+            // 아직 앞 파트 더 필요: 새 파트 안정 후 끝으로 이동해 순방향 전환 체인
+            const vid = activeVideo;
+            setTimeout(() => {
+                if (pendingSeekAbsSec !== null && activeVideo === vid) {
+                    const d = vid.duration;
+                    if (!d || !isFinite(d)) return;
+                    vid.currentTime = d;
+                    if (vid.paused) vid.play().catch(() => {});
+                }
+            }, 500);
+        } else {
+            // 이전 파트 더 필요: 파트 시작(0) → ← 키로 역방향 전환 체인
+            const vid = activeVideo;
+            setTimeout(() => {
+                if (pendingSeekAbsSec !== null && activeVideo === vid) {
+                    triggerPartReverse(vid, pendingSeekAbsSec);
+                }
+            }, 500);
+        }
+    }
+
+    function attachPartDetector(video) {
+        video.addEventListener('loadstart', () => {
+            if (isLiveMode || partDurations.length === 0) return;
+            video.addEventListener('loadedmetadata', () => {
+                matchPartByDuration(video.duration);
+            }, { once: true });
+        });
+    }
+
     function initVideoFinder() {
-        const checkInterval = setInterval(() => {
+        function handleNewVideo(video) {
+            if (video === activeVideo) return;
+            activeVideo = video;
+            if (!isLiveMode) {
+                // 이미 메타데이터가 로드된 상태면 즉시 파트 인덱스 동기화
+                if (video.readyState >= 1) {
+                    matchPartByDuration(video.duration);
+                } else if (partDurations.length > 0) {
+                    // 아직 메타데이터 로드 전: loadedmetadata를 직접 대기
+                    video.addEventListener('loadedmetadata', () => matchPartByDuration(video.duration), { once: true });
+                }
+            }
+            attachPartDetector(video);
+        }
+
+        // 초기 video 감지
+        const initial = document.querySelector('video');
+        if (initial) handleNewVideo(initial);
+
+        // MutationObserver: SOOP이 파트 전환 시 새 <video> 엘리먼트 생성하는 경우 즉시 감지
+        // (1s interval보다 빠르게 반응해 loadedmetadata를 놓치지 않음)
+        const observer = new MutationObserver(() => {
             const video = document.querySelector('video');
-            if (video && video !== activeVideo) { activeVideo = video; clearInterval(checkInterval); }
+            if (video && video !== activeVideo) handleNewVideo(video);
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+
+        // interval 폴백: MutationObserver가 놓친 경우 대비
+        setInterval(() => {
+            const video = document.querySelector('video');
+            if (video && video !== activeVideo) handleNewVideo(video);
         }, 1000);
+    }
+
+    function getCurrentPartOffset() {
+        return partOffsets[currentPartIdx] || 0;
+    }
+
+    function getTargetPartIdx(absoluteSec) {
+        let idx = 0;
+        for (let i = partOffsets.length - 1; i >= 0; i--) {
+            if (absoluteSec >= partOffsets[i]) { idx = i; break; }
+        }
+        return idx;
+    }
+
+    function trySeekViaSOOPBar(absoluteSec) {
+        const totalDuration = partOffsets[partOffsets.length - 1] + (partDurations[partDurations.length - 1] || 0);
+        if (totalDuration <= 0) return false;
+        const ratio = Math.min(1, Math.max(0, absoluteSec / totalDuration));
+
+        // 1. input[type=range] 중 max 값이 전체 시간(초 또는 ms)과 일치하는 엘리먼트 탐색
+        const allRanges = document.querySelectorAll('input[type=range]');
+        for (const inp of allRanges) {
+            const maxVal = parseFloat(inp.max);
+            if (!maxVal) continue;
+            const isMs = Math.abs(maxVal - totalDuration * 1000) < totalDuration * 50; // ms scale (5% tolerance)
+            const isSec = Math.abs(maxVal - totalDuration) < totalDuration * 0.05;     // sec scale
+            if (!isMs && !isSec) continue;
+            inp.value = isMs ? absoluteSec * 1000 : absoluteSec;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }
+
+        // 2. 고정 셀렉터 후보 (div/span 기반 커스텀 시크바)
+        const barSelectors = ['.vod-progress-bar', '.seekBar', '#seekBar', '.player-progress',
+                              '[class*="progressBar"]', '[class*="seekbar" i]', '[class*="seek-bar" i]'];
+        for (const sel of barSelectors) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 10) continue;
+            const cx = rect.left + rect.width * ratio;
+            const cy = rect.top + rect.height / 2;
+            ['mousedown', 'mouseup', 'click'].forEach(t =>
+                el.dispatchEvent(new MouseEvent(t, { bubbles: true, clientX: cx, clientY: cy }))
+            );
+            return true;
+        }
+        return false;
+    }
+
+    function dispatchSOOPArrowKey(dir) {
+        const key = dir === 'right' ? 'ArrowRight' : 'ArrowLeft';
+        const keyCode = dir === 'right' ? 39 : 37;
+        const opts = { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true };
+        const target = activeVideo?.closest('[class*="player"]') || activeVideo?.parentElement || document.body;
+        target.dispatchEvent(new KeyboardEvent('keydown', opts));
+        target.dispatchEvent(new KeyboardEvent('keyup', opts));
+    }
+
+    function triggerPartAdvance(vid, targetAbsSec) {
+        pendingSeekAbsSec = targetAbsSec;
+        const d = vid.duration;
+        if (!d || !isFinite(d)) return;
+        // duration 끝으로 seek → play() 호출 시 ended가 즉시 발생해 SOOP이 다음 파트 로드
+        vid.currentTime = d;
+        if (vid.paused) vid.play().catch(() => {});
+    }
+
+    function triggerPartReverse(vid, targetAbsSec) {
+        pendingSeekAbsSec = targetAbsSec;
+        // 현재 파트 시작으로 이동 후 ← 키 → SOOP이 이전 파트로 이동
+        vid.currentTime = 0;
+        setTimeout(() => dispatchSOOPArrowKey('left'), 300);
+    }
+
+    function seekToTime(absoluteSec) {
+        if (!activeVideo) return;
+
+        const targetPartIdx = getTargetPartIdx(absoluteSec);
+        const relativeTime = absoluteSec - (partOffsets[targetPartIdx] || 0);
+
+        if (targetPartIdx === currentPartIdx || partDurations.length === 0) {
+            pendingSeekAbsSec = null;
+            const relTime = Math.max(0, relativeTime);
+            if (activeVideo.duration && relTime > activeVideo.duration) {
+                if (!trySeekViaSOOPBar(absoluteSec)) triggerPartAdvance(activeVideo, absoluteSec);
+            } else {
+                activeVideo.currentTime = relTime;
+            }
+            return;
+        }
+
+        // 크로스-파트 seek: SOOP 시크바 먼저 시도
+        if (trySeekViaSOOPBar(absoluteSec)) return;
+
+        if (targetPartIdx > currentPartIdx) {
+            // 순방향: ended 이벤트로 파트 전환 체인
+            triggerPartAdvance(activeVideo, absoluteSec);
+        } else {
+            // 역방향: 현재 파트 시작(0) → ← 키 → SOOP 이전 파트 진입 → 체인 반복
+            triggerPartReverse(activeVideo, absoluteSec);
+        }
+    }
+
+    function initPartOffsets() {
+        if (isLiveMode) return;
+        const titleMatch = window.location.href.match(/\/player\/(\d+)/);
+        if (!titleMatch) return;
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url: 'https://api.m.sooplive.com/station/video/a/view',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            data: `nTitleNo=${titleMatch[1]}`,
+            onload(resp) {
+                try {
+                    const files = JSON.parse(resp.responseText)?.data?.files;
+                    if (Array.isArray(files) && files.length > 1) {
+                        let cum = 0;
+                        const offsets = [], durations = [];
+                        for (const f of files) {
+                            offsets.push(cum);
+                            const dur = (f.duration || 18000000) / 1000;
+                            durations.push(dur);
+                            cum += dur;
+                        }
+                        partOffsets = offsets;
+                        partDurations = durations;
+                    }
+                } catch(e) {}
+            },
+            onerror() {} // 18000초 폴백: 파트 전환 시 onLoadStart에서 자동 확장
+        });
     }
 
     // 🌟 가공 복사 시 오직 '현재 활성화된 페이지 내부' 텍스트만 조율 연산
@@ -100,7 +332,7 @@
             const prefix = currentDepth === 0 ? '' : 'ㅤ'.repeat(currentDepth - 1) + 'ㄴ';
             
             return lines.map((line, idx) => {
-                if (idx === 0) return `${prefix}${item.timeStr} ${line}`;
+                if (idx === 0) return item.isText ? `${prefix}${line}` : `${prefix}${item.timeStr} ${line}`;
                 const fallbackSpace = currentDepth === 0 ? 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤ' : 'ㅤ'.repeat(currentDepth - 1) + 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤㅤ';
                 return `${fallbackSpace}${line}`;
             }).join('\n');
@@ -116,7 +348,9 @@
     function updateCounterUI() {
         const metrics = calculateTextMetrics();
         counterDisplay.innerText = `${metrics.length}/5000 (현재 페이지)`;
-        renderPageTabs(); 
+        const colorClass = metrics.length >= 4000 ? 'cnt-red' : metrics.length >= 3000 ? 'cnt-orange' : 'cnt-green';
+        counterDisplay.className = `tl-counter ${colorClass}`;
+        renderPageTabs();
     }
 
     // --- 드래그 유틸 엔진 ---
@@ -162,7 +396,10 @@
         #tl-sidebar.minimized .tl-page-nav-bar, #tl-sidebar.minimized .tl-toolbar, #tl-sidebar.minimized .tl-body, #tl-sidebar.minimized .tl-footer { display: none !important; }
         
         .tl-header { padding: 14px; background: #22222a; border-top-left-radius: 12px; border-top-right-radius: 12px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2f2f37; }
-        .tl-counter { font-size: 11px; color: #00b074; background: rgba(0, 176, 116, 0.1); padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+        .tl-counter { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; min-width: 140px; text-align: center; box-sizing: border-box; }
+        .tl-counter.cnt-green  { color: #00b074; background: rgba(0,176,116,0.12); }
+        .tl-counter.cnt-orange { color: #ff9030; background: rgba(255,144,48,0.12); }
+        .tl-counter.cnt-red    { color: #e54444; background: rgba(229,68,68,0.12); }
         .tl-mode-badge { font-size: 10px; padding: 2px 5px; border-radius: 4px; font-weight: bold; margin-left: 4px; }
         .tl-mode-badge.live { background: #e54444; color: white; }
         .tl-mode-badge.vod { background: #00b074; color: white; }
@@ -177,6 +414,8 @@
         .tl-page-central-display { flex: 1; text-align: center; font-size: 12px; font-weight: bold; color: #00b074; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: #111115; padding: 4px 2px; border-radius: 4px; border: 1px solid #23232a; }
         .tl-page-add-trigger { background: #00b074; color: white; border: none; font-size: 11px; font-weight: bold; padding: 5px 10px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
         .tl-page-add-trigger:hover { background: #008f5e; }
+        .tl-page-del-trigger { background: transparent; border: 1px solid #555; color: #e06060; font-size: 13px; padding: 3px 7px; border-radius: 4px; cursor: pointer; line-height: 1; }
+        .tl-page-del-trigger:hover { background: #3a1a1a; border-color: #e06060; }
 
         .tl-toolbar { padding: 8px 12px; background: #1f1f24; border-bottom: 1px solid #2f2f37; display: flex; align-items: center; min-height: 32px; justify-content: center; }
         .tl-emoji-container { display: flex; gap: 6px; align-items: center; flex: 1; overflow-x: auto; white-space: nowrap; }
@@ -195,6 +434,8 @@
         .tl-btn-huge-modify:hover { background: #008f5e; }
         .tl-btn-all-select { background: #3a3a44; color: #ffbc00; border: 1px solid #4a4a55; font-size: 11px; font-weight: bold; padding: 4px 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; }
         .tl-btn-all-select:hover { background: #4a4a55; color: #ffcc22; }
+        .tl-btn-type-toggle { background: #3a3a44; color: #a0c8ff; border: 1px solid #4a4a55; font-size: 11px; font-weight: bold; padding: 4px 8px; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; }
+        .tl-btn-type-toggle:hover { background: #4a4a55; color: #c0d8ff; }
 
         .tl-body { flex: 1; overflow-y: auto; padding: 12px; }
         .tl-row { display: flex; align-items: flex-start; margin-bottom: 6px; gap: 6px; padding: 4px; border-radius: 6px; transition: background-color 0.1s; }
@@ -208,6 +449,8 @@
         .tl-time-btn { background: #00b074; color: white; border: none; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600; white-space: nowrap; user-select: none; margin-top: 2px; }
         .tl-time-btn:hover { background: #008f5e; }
         .tl-time-btn.live-btn { background: #4e4e56; cursor: default; }
+        .tl-time-btn.text-mode { background: #4e4e56; color: #999; cursor: pointer; }
+        .tl-time-btn.text-mode:hover { background: #5e5e68; }
 
         .tl-input { 
             flex: 1; background: #232329; border: 1px solid #3a3a44; color: white; 
@@ -246,13 +489,139 @@
         .tl-kbd-btn-change { background: #00b074; color: white; border: none; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; float: right; }
         .tl-kbd-btn-change.recording { background: #e54444 !important; animation: tl-blink 1s infinite; }
         @keyframes tl-blink { 50% { opacity: 0.5; } }
+
+        .tl-modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; padding-top: 12px; border-top: 1px solid #3a3a44; }
+        .tl-h-input-grid { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
+        .tl-h-time-box { background: #232329; border: 1px solid #3a3a44; color: white; padding: 6px 8px; border-radius: 6px; font-size: 13px; width: 56px; text-align: center; }
+        .tl-h-time-box:focus { border-color: #00b074; outline: none; }
+        .tl-h-select { background: #232329; border: 1px solid #3a3a44; color: white; padding: 6px 8px; border-radius: 6px; font-size: 13px; cursor: pointer; }
     `);
 
     // --- 5. UI 레이아웃 빌드 ---
-    const mainDragWrapper = sidebar; 
+    const sidebar = document.createElement('div');
+    sidebar.id = 'tl-sidebar';
+    const modeBadgeHtml = isLiveMode
+        ? '<span class="tl-mode-badge live">LIVE</span>'
+        : '<span class="tl-mode-badge vod">VOD</span>';
+    sidebar.innerHTML = `
+        <div class="tl-header">
+            <span style="font-size:13px; font-weight:bold; cursor:move; user-select:none;">🗒 타임라인 에디터</span>
+            <div class="tl-header-actions">
+                ${modeBadgeHtml}
+                <span id="tl-char-counter" class="tl-counter cnt-green">0/5000 (현재 페이지)</span>
+                <span class="tl-action-icon" id="tl-btn-settings" title="설정">⚙️</span>
+                <span class="tl-action-icon" id="tl-btn-help" title="단축키 도움말">❓</span>
+                <span class="tl-action-icon" id="tl-btn-minimize" title="최소화">➖</span>
+            </div>
+        </div>
+        <div id="tl-dynamic-toolbar" class="tl-toolbar"></div>
+        <div id="tl-body" class="tl-body"></div>
+        <div class="tl-footer">
+            <button id="tl-btn-export" class="tl-btn-main">📋 복사</button>
+            <button id="tl-btn-import" class="tl-btn-sub">📥 가져오기</button>
+            <button id="tl-btn-clear" class="tl-btn-sub tl-btn-danger">🗑 삭제</button>
+        </div>
+    `;
+    document.body.appendChild(sidebar);
+    makeElementDraggable(sidebar, 'tl-header', true);
+    sidebar.querySelector('#tl-btn-minimize').addEventListener('click', () => {
+        sidebar.classList.toggle('minimized');
+    });
+
+    const mainDragWrapper = sidebar;
     const bodyContainer = sidebar.querySelector('#tl-body');
     const dynamicToolbar = sidebar.querySelector('#tl-dynamic-toolbar');
     const counterDisplay = sidebar.querySelector('#tl-char-counter');
+
+    function showConfirmPopup(message, onConfirm) {
+        document.getElementById('tl-confirm-mask')?.remove();
+        document.getElementById('tl-confirm-modal')?.remove();
+
+        const mask = document.createElement('div');
+        mask.id = 'tl-confirm-mask';
+        Object.assign(mask.style, { position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.5)', zIndex: '2147483645' });
+
+        const modal = document.createElement('div');
+        modal.id = 'tl-confirm-modal';
+        Object.assign(modal.style, {
+            position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
+            background: '#222', color: '#fff', borderRadius: '8px', padding: '20px 24px',
+            zIndex: '2147483646', minWidth: '240px', textAlign: 'center', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+            fontFamily: 'sans-serif', fontSize: '14px'
+        });
+        modal.innerHTML = `
+            <div style="margin-bottom:10px;font-size:15px;">${message}</div>
+            <div style="color:#aaa;font-size:12px;margin-bottom:14px;">예(Enter) / 아니오(Esc)</div>
+            <div style="display:flex;gap:8px;justify-content:center;">
+                <button id="tl-confirm-yes" style="padding:6px 18px;background:#4a9eff;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">예</button>
+                <button id="tl-confirm-no"  style="padding:6px 18px;background:#555;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">아니오</button>
+            </div>
+        `;
+
+        function close() {
+            mask.remove(); modal.remove();
+            window.removeEventListener('keydown', keyHandler, true);
+        }
+        function confirm() { close(); onConfirm(); }
+
+        function keyHandler(e) {
+            if (e.key === 'Enter')  { e.preventDefault(); e.stopImmediatePropagation(); confirm(); }
+            if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); }
+        }
+        modal.querySelector('#tl-confirm-yes').addEventListener('click', confirm);
+        modal.querySelector('#tl-confirm-no').addEventListener('click', close);
+        mask.addEventListener('click', close);
+        window.addEventListener('keydown', keyHandler, true);
+        document.body.appendChild(mask);
+        document.body.appendChild(modal);
+        modal.querySelector('#tl-confirm-yes').focus();
+    }
+
+    function showNoticePopup(message) {
+        document.getElementById('tl-notice-mask')?.remove();
+        document.getElementById('tl-notice-modal')?.remove();
+        const mask = document.createElement('div');
+        mask.id = 'tl-notice-mask';
+        Object.assign(mask.style, { position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.45)', zIndex: '2147483645' });
+        const modal = document.createElement('div');
+        modal.id = 'tl-notice-modal';
+        Object.assign(modal.style, {
+            position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
+            background: '#222', color: '#fff', borderRadius: '8px', padding: '20px 24px',
+            zIndex: '2147483646', minWidth: '240px', textAlign: 'center', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+            fontFamily: 'sans-serif', fontSize: '14px'
+        });
+        modal.innerHTML = `
+            <div style="margin-bottom:10px;font-size:15px;">${message}</div>
+            <div style="color:#aaa;font-size:12px;margin-bottom:14px;">Enter 또는 Esc로 닫기</div>
+            <button id="tl-notice-close" style="padding:6px 18px;background:#4a9eff;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">확인</button>
+        `;
+        function close() { mask.remove(); modal.remove(); window.removeEventListener('keydown', kh, true); }
+        function kh(e) { if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); } }
+        modal.querySelector('#tl-notice-close').addEventListener('click', close);
+        mask.addEventListener('click', close);
+        window.addEventListener('keydown', kh, true);
+        document.body.appendChild(mask);
+        document.body.appendChild(modal);
+        modal.querySelector('#tl-notice-close').focus();
+    }
+
+    function checkAndOverflowPage() {
+        const metrics = calculateTextMetrics();
+        if (metrics.length <= 5000) return;
+        const activeList = getActiveList();
+        if (activeList.length === 0) return;
+        // 마지막 아이템을 다음 페이지로 이동
+        const overflowItem = activeList.splice(activeList.length - 1, 1)[0];
+        const nextIdx = pageState.currentPageIdx + 1;
+        if (nextIdx >= pageState.pages.length) {
+            pageState.pages.push({ pageName: `댓글 ${pageState.pages.length + 1}`, list: [] });
+        }
+        pageState.pages[nextIdx].list.push(overflowItem);
+        pageState.pages[nextIdx].list.sort((a, b) => a.seconds - b.seconds);
+        savePageState(); render(); refreshToolbarUI();
+        showNoticePopup(`⚠️ 5000자를 초과하여 마지막 항목을 ${nextIdx + 1}페이지로 이동했습니다.`);
+    }
 
     // 페이지 인디케이터 컨테이너 상단 윗줄 개설 주입
     const pageNavBar = document.createElement('div');
@@ -267,6 +636,7 @@
             <div class="tl-page-central-display">PAGE: ${displayIndex} / ${totalPages}</div>
             <button class="tl-page-arrow-btn" id="tl-page-btn-next">▶</button>
             <button class="tl-page-add-trigger" id="tl-page-btn-add">➕ 페이지 추가</button>
+            <button class="tl-page-del-trigger" id="tl-page-btn-del" title="현재 페이지 삭제">🗑</button>
         `;
 
         pageNavBar.querySelector('#tl-page-btn-prev').addEventListener('click', () => {
@@ -281,6 +651,14 @@
             pageState.currentPageIdx = pageState.pages.length - 1;
             currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
         });
+        pageNavBar.querySelector('#tl-page-btn-del').addEventListener('click', () => {
+            if (pageState.pages.length <= 1) return; // 마지막 페이지는 삭제 불가
+            showConfirmPopup('현재 페이지를 삭제하시겠습니까?', () => {
+                pageState.pages.splice(pageState.currentPageIdx, 1);
+                if (pageState.currentPageIdx >= pageState.pages.length) pageState.currentPageIdx = pageState.pages.length - 1;
+                currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
+            });
+        });
     }
 
     function refreshToolbarUI() {
@@ -293,12 +671,16 @@
             const panelWrapper = document.createElement('div');
             panelWrapper.className = 'tl-time-panel-wrapper';
             const toggleSelectText = isAllChecked ? '❌ 전체 해제' : '☑️ 현재페이지 전체선택';
+            const selectedItems = activeList.filter(item => item.selected);
+            const allSelectedAreText = selectedItems.length > 0 && selectedItems.every(item => item.isText);
+            const typeToggleLabel = allSelectedAreText ? '⏱ 타임라인으로 변경' : '📝 텍스트로 변경';
 
             panelWrapper.innerHTML = `
                 <div class="tl-adjust-group"><button class="tl-adj-btn" id="tl-dyn-m5">-5s</button><button class="tl-adj-btn" id="tl-dyn-m1">-1s</button></div>
                 <div class="tl-toolbar-btn-group">
                     <button class="tl-btn-huge-modify" id="tl-dyn-huge">⏳ 일괄조정</button>
                     <button class="tl-btn-all-select" id="tl-dyn-all-toggle">${toggleSelectText}</button>
+                    <button class="tl-btn-type-toggle" id="tl-dyn-type-toggle">${typeToggleLabel}</button>
                 </div>
                 <div class="tl-adjust-group"><button class="tl-adj-btn plus" id="tl-dyn-p1">+1s</button><button class="tl-adj-btn plus" id="tl-dyn-p2">+5s</button></div>
             `;
@@ -311,6 +693,12 @@
             panelWrapper.querySelector('#tl-dyn-huge').addEventListener('click', () => openHugeModifyModal());
             panelWrapper.querySelector('#tl-dyn-all-toggle').addEventListener('click', () => {
                 const nextState = !isAllChecked; activeList.forEach(item => item.selected = nextState); render(); refreshToolbarUI();
+            });
+            panelWrapper.querySelector('#tl-dyn-type-toggle').addEventListener('click', () => {
+                const newIsText = !allSelectedAreText;
+                selectedItems.forEach(item => { item.isText = newIsText; });
+                savePageState(); render(); refreshToolbarUI();
+                if (!newIsText) checkAndOverflowPage(); // 텍스트 → 타임라인 전환 시만 체크
             });
         } else {
             const emojiContainer = document.createElement('div');
@@ -333,7 +721,7 @@
             row.className = `tl-row tl-depth-${item.depth || 0} ${item.selected ? 'tl-selected' : ''} ${isFocused ? 'tl-focused' : ''}`;
             row.dataset.index = index;
             
-            const btnClass = isLiveMode ? 'tl-time-btn live-btn' : 'tl-time-btn';
+            const btnClass = isLiveMode ? 'tl-time-btn live-btn' : (item.isText ? 'tl-time-btn text-mode' : 'tl-time-btn');
             row.innerHTML = `
                 <input type="checkbox" class="tl-checkbox" ${item.selected ? 'checked' : ''}>
                 <button class="${btnClass}" data-time="${item.seconds}">${item.timeStr}</button>
@@ -396,7 +784,7 @@
             pageState.currentPageIdx = pageState.pages.length - 1;
         }
 
-        let currentSec = activeVideo.currentTime; let timeStr = formatTime(currentSec);
+        let currentSec = activeVideo.currentTime + getCurrentPartOffset(); let timeStr = formatTime(currentSec);
         if (isLiveMode) {
             const liveTimeElement = document.getElementById('time');
             if (liveTimeElement) {
@@ -506,15 +894,17 @@
                                 (isMac ? (e.metaKey === hotkeys.addTimestamp.meta) : (e.altKey === hotkeys.addTimestamp.alt));
 
             if (matchAddKey) {
-                e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; 
+                e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
                 bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
-                e.target.blur(); if (activeVideo) activeVideo.focus(); return;
+                e.target.blur(); if (activeVideo) activeVideo.focus();
+                checkAndOverflowPage(); return;
             }
             if (e.key === 'Enter' || e.keyCode === 13) { e.stopPropagation(); setTimeout(() => autoResizeTextarea(e.target), 10); return; }
             if (e.key === 'Escape' || e.keyCode === 27) {
                 e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
                 bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
-                e.target.blur(); if (activeVideo) activeVideo.focus(); return;
+                e.target.blur(); if (activeVideo) activeVideo.focus();
+                checkAndOverflowPage(); return;
             }
             e.stopPropagation(); 
         }
@@ -535,15 +925,31 @@
     document.getElementById('tl-btn-import').addEventListener('click', () => {
         const rawText = prompt('타임라인 텍스트를 붙여넣으세요 (현재 탭에 추가 정렬됩니다):'); if (!rawText) return;
         const lines = rawText.split('\n'); const imported = getActiveList();
+        let lastSeconds = -1; // 임포트 내 마지막 아이템 시간 트래킹
         lines.forEach(line => {
+            if (!line.trim()) return; // 빈 줄 무시
             const match = line.match(/(?:(\d{1,2}):)?(\d{2}):(\d{2})/);
             if (match) {
                 const timeStr = match[0]; const totalSeconds = (match[1] ? parseInt(match[1])*3600 : 0) + parseInt(match[2])*60 + parseInt(match[3]);
                 const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
-                imported.push({ 
-                    seconds: totalSeconds, timeStr: timeStr.padStart(8, '0'), 
-                    text: line.replace(/^ㅤ*ㄴ*/, '').trim().replace(/\[?\s*(?:(?:\d{1,2}):)?(?:\d{2}):(?:\d{2})\s*\]?/, '').trim(), 
-                    depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0), selected: false 
+                lastSeconds = totalSeconds;
+                imported.push({
+                    seconds: totalSeconds, timeStr: timeStr.padStart(8, '0'),
+                    text: line.replace(/^ㅤ*ㄴ*/, '').trim().replace(/\[?\s*(?:(?:\d{1,2}):)?(?:\d{2}):(?:\d{2})\s*\]?/, '').trim(),
+                    depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0), selected: false
+                });
+            } else {
+                // 타임라인 형식이 아님: 직전 시간 + 1초, 없으면 0초
+                const textSeconds = lastSeconds < 0 ? 0 : lastSeconds + 1;
+                lastSeconds = textSeconds;
+                const h = Math.floor(textSeconds / 3600), m = Math.floor((textSeconds % 3600) / 60), s = textSeconds % 60;
+                const timeStr = `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`.padStart(8, '0');
+                const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
+                imported.push({
+                    seconds: textSeconds, timeStr,
+                    text: line.replace(/^ㅤ*ㄴ*/, '').trim(),
+                    depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0),
+                    selected: false, isText: true
                 });
             }
         });
@@ -582,7 +988,49 @@
         });
     }
 
+    function openSettingsModal() {
+        const mask = document.createElement('div'); mask.className = 'tl-modal-mask'; mask.id = 'tl-sett-mask';
+        const modal = document.createElement('div'); modal.className = 'tledit-popup-box'; modal.id = 'tl-sett-modal';
+        modal.innerHTML = `
+            <div class="tledit-popup-header-area"><span class="tledit-popup-title-text">⚙️ 설정</span></div>
+            <div style="flex:1; overflow-y:auto; font-size:13px; color:#ddd;">
+                <table class="tl-help-table">
+                    <tr><td style="color:#00b074; font-weight:bold; white-space:nowrap;">탐색 간격 (초)</td>
+                        <td><input type="number" id="tl-sett-skip" class="tl-h-time-box tl-emoji-highlight-input" value="${skipSeconds}" min="1" max="60"></td></tr>
+                    ${isLiveMode ? `<tr><td style="color:#00b074; font-weight:bold; white-space:nowrap;">라이브 오프셋 (초)</td>
+                        <td><input type="number" id="tl-sett-offset" class="tl-h-time-box tl-emoji-highlight-input" value="${liveOffsetSeconds}"></td></tr>` : ''}
+                    <tr><td colspan="2" style="color:#00b074; font-weight:bold; padding-top:12px;">이모지 프리셋 (쉼표로 구분)</td></tr>
+                    <tr><td colspan="2"><input type="text" id="tl-sett-emoji" class="tl-input tl-emoji-highlight-input" style="width:100%; box-sizing:border-box;" value="${customEmojis.join(',')}"></td></tr>
+                </table>
+            </div>
+            <div class="tl-modal-footer">
+                <button class="tl-btn-sub" id="tl-sett-cancel">취소</button>
+                <button class="tl-btn-main" id="tl-sett-save">저장</button>
+            </div>
+        `;
+        document.body.appendChild(mask); document.body.appendChild(modal);
+        makeElementDraggable(modal, 'tledit-popup-title-text', false);
+
+        window.saveTimelineSettingsData = () => {
+            const skipVal = parseInt(modal.querySelector('#tl-sett-skip')?.value, 10);
+            if (!isNaN(skipVal) && skipVal > 0) { skipSeconds = skipVal; GM_setValue('soop_global_skip_seconds', skipSeconds); }
+            if (isLiveMode) {
+                const offVal = parseInt(modal.querySelector('#tl-sett-offset')?.value, 10);
+                if (!isNaN(offVal)) { liveOffsetSeconds = offVal; GM_setValue('soop_global_live_offset', liveOffsetSeconds); }
+            }
+            const emojiStr = modal.querySelector('#tl-sett-emoji')?.value || '';
+            const newEmojis = emojiStr.split(',').map(s => s.trim()).filter(Boolean);
+            if (newEmojis.length > 0) { customEmojis = newEmojis; GM_setValue('soop_global_custom_emojis', customEmojis); }
+            refreshToolbarUI();
+        };
+
+        const cleanUp = () => { window.saveTimelineSettingsData = undefined; mask.remove(); modal.remove(); };
+        modal.querySelector('#tl-sett-cancel').addEventListener('click', cleanUp);
+        modal.querySelector('#tl-sett-save').addEventListener('click', () => { window.saveTimelineSettingsData(); cleanUp(); });
+    }
+
     document.getElementById('tl-btn-help').addEventListener('click', openHelpAndHotkeyModal);
+    document.getElementById('tl-btn-settings').addEventListener('click', openSettingsModal);
 
     // 글로벌 핫키 핸들러 계층
     window.addEventListener('keydown', (e) => {
@@ -618,10 +1066,10 @@
             if (modalClosed) { e.preventDefault(); e.stopPropagation(); return; }
 
             const activeList = getActiveList(); const hasCheckedItem = activeList.some(item => item.selected);
-            if (hasCheckedItem && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); e.stopPropagation(); activeList.forEach(item => item.selected = false); currentFocusedIdx = -1; render(); refreshToolbarUI(); return; }
+            if (hasCheckedItem && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); e.stopPropagation(); activeList.forEach(item => { item.selected = false; }); currentFocusedIdx = -1; render(); refreshToolbarUI(); return; }
         }
 
-        if (document.getElementById('tl-sett-modal') || document.getElementById('tl-huge-modal')) return;
+        if (document.getElementById('tl-sett-modal') || document.getElementById('tl-huge-modal') || document.getElementById('tl-confirm-modal') || document.getElementById('tl-notice-modal')) return;
 
         const isMatch = (hk) => { return (e.key.toLowerCase() === hk.key.toLowerCase()) && (e.ctrlKey === hk.ctrl) && (e.shiftKey === hk.shift) && (isMac ? (e.metaKey === hk.meta) : (e.altKey === hk.alt)); };
 
@@ -648,9 +1096,32 @@
         if (isMatch(hotkeys.timeMinus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-5); return; }
         if (isMatch(hotkeys.timePlus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(5); return; }
 
-        if (e.key === 'ArrowLeft' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(Math.max(0, activeVideo.currentTime - skipSeconds)); return; }
-        if (e.key === 'ArrowRight' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(Math.min(activeVideo.duration, activeVideo.currentTime + skipSeconds)); return; }
+        if (isMainModifier && e.key === 'ArrowLeft') {
+            e.preventDefault(); e.stopPropagation();
+            if (pageState.currentPageIdx > 0) { pageState.currentPageIdx--; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
+            return;
+        }
+        if (isMainModifier && e.key === 'ArrowRight') {
+            e.preventDefault(); e.stopPropagation();
+            if (pageState.currentPageIdx < pageState.pages.length - 1) {
+                pageState.currentPageIdx++; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
+            } else {
+                showConfirmPopup('새로운 페이지를 만드시겠습니까?', () => {
+                    const nextNum = pageState.pages.length + 1;
+                    pageState.pages.push({ pageName: `댓글 ${nextNum}`, list: [] });
+                    pageState.currentPageIdx = pageState.pages.length - 1;
+                    currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
+                });
+            }
+            return;
+        }
+
+        if (e.key === 'ArrowLeft' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(getCurrentPartOffset() + Math.max(0, activeVideo.currentTime - skipSeconds)); return; }
+        if (e.key === 'ArrowRight' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(getCurrentPartOffset() + Math.min(activeVideo.duration, activeVideo.currentTime + skipSeconds)); return; }
     }, true); 
 
-    initVideoFinder(); refreshToolbarUI(); render();
+    initVideoFinder(); initPartOffsets(); refreshToolbarUI(); render();
+
+    // 이전 버전에서 저장된 stale reload seek 데이터 정리
+    GM_setValue('soop_pending_seek_reload', null);
 })();
