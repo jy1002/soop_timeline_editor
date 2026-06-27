@@ -1,0 +1,17 @@
+# Python / uv
+qa/.venv/
+qa/__pycache__/
+qa/tests/__pycache__/
+qa/.pytest_cache/
+qa/main.py
+qa/README.md
+**/__pycache__/
+*.pyc
+
+# Playwright
+/test-results/
+/playwright-report/
+
+# OS
+.DS_Store
+Thumbs.db
