@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOOP 타임라인 에디터
 // @namespace    http://tampermonkey.net/
-// @version      9.10
-// @description  5000자 기준 자동/수동 페이지 분할로 대용량 렉 전면 박멸, Cmd(Alt)+Backspace 즉시 삭제 및 스마트 단축키 커스텀 집대성 버전
+// @version      9.20
+// @description  5000자 기준 자동/수동 페이지 분할로 대용량 렉 전면 박멸, 입력 디바운스·rAF 드래그 성능 최적화, Cmd(Alt)+Backspace 즉시 삭제 및 스마트 단축키 커스텀 집대성 버전
 // @author       소해999
 // @match        https://vod.sooplive.com/player/*
 // @match        https://vod.sooplive.co.kr/player/*
@@ -28,6 +28,7 @@
     // --- 2. 단축키 순정 기본값 매핑 정의 부문 ---
     const defaultHotkeys = {
         addTimestamp: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'Enter', label: '타임스탬프 추가/완료' },
+        addTextTimestamp: { ctrl: false, alt: !isMac, shift: true, meta: isMac, key: 'Enter', label: '텍스트 타임스탬프 추가' },
         scrollTop: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'ArrowUp', label: '창 맨 위로 스크롤' },
         scrollBottom: { ctrl: false, alt: !isMac, shift: false, meta: isMac, key: 'ArrowDown', label: '창 맨 아래로 스크롤' },
         timeMinus1: { ctrl: false, alt: false, shift: false, meta: false, key: '[', label: '선택 항목 -1초 가감' },
@@ -38,6 +39,7 @@
     };
 
     let hotkeys = GM_getValue('soop_global_hotkeys_v9_5', JSON.parse(JSON.stringify(defaultHotkeys)));
+    if (!hotkeys.addTextTimestamp) hotkeys.addTextTimestamp = defaultHotkeys.addTextTimestamp;
 
     // --- 3. 🌟 2차원 데이터 레이어 로드 및 구조 마이그레이션 가드 ---
     let skipSeconds = GM_getValue('soop_global_skip_seconds', 5); 
@@ -85,6 +87,13 @@
         GM_setValue('soop_global_page_structure_v9_5', pageState);
     }
 
+    function debounce(fn, ms) {
+        let timer;
+        return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+    }
+    const debouncedSave = debounce(savePageState, 800);
+    const debouncedUpdateCounter = debounce(() => updateCounterUI(), 200);
+
     function formatTime(seconds) {
         const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
         const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
@@ -93,7 +102,7 @@
     }
 
     function autoResizeTextarea(el) {
-        el.style.height = 'auto';
+        el.style.height = '0';
         el.style.height = el.scrollHeight + 'px';
     }
 
@@ -366,7 +375,7 @@
             targetElement.style.top = ((window.innerHeight - modalHeight) / 2) + 'px';
         }
 
-        let isDragging = false; let offsetX = 0; let offsetY = 0;
+        let isDragging = false; let offsetX = 0; let offsetY = 0; let rafPending = false;
 
         dragHandle.addEventListener('mousedown', (e) => {
             isDragging = true;
@@ -378,7 +387,10 @@
             document.body.style.userSelect = 'none'; e.preventDefault(); e.stopPropagation();
         }, true);
 
-        window.addEventListener('mousemove', (e) => { if (!isDragging) return; e.preventDefault(); targetElement.style.left = (e.clientX - offsetX) + 'px'; targetElement.style.top = (e.clientY - offsetY) + 'px'; }, true);
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return; e.preventDefault();
+            if (!rafPending) { rafPending = true; requestAnimationFrame(() => { targetElement.style.left = (e.clientX - offsetX) + 'px'; targetElement.style.top = (e.clientY - offsetY) + 'px'; rafPending = false; }); }
+        }, true);
         window.addEventListener('mouseup', (e) => { if (isDragging) { isDragging = false; document.body.style.userSelect = ''; e.stopPropagation(); } }, true);
     }
 
@@ -458,6 +470,7 @@
             resize: none; font-family: inherit; line-height: 1.4; height: 20px; min-height: 20px; overflow-y: hidden;
         }
         .tl-input:focus { border-color: #00b074; outline: none; }
+        #tl-sidebar button:focus, #tl-sidebar input[type="checkbox"]:focus { outline: none; }
         .tl-del-btn { background: #e54444; border: none; color: white; border-radius: 6px; cursor: pointer; padding: 5px 8px; font-size: 11px; user-select: none; margin-top: 2px; }
         .tl-del-btn:hover { background: #bd3232; }
         
@@ -628,37 +641,44 @@
     pageNavBar.className = 'tl-page-nav-bar';
     sidebar.insertBefore(pageNavBar, dynamicToolbar);
 
-    function renderPageTabs() {
-        const totalPages = pageState.pages.length;
-        const displayIndex = pageState.currentPageIdx + 1;
-        pageNavBar.innerHTML = `
-            <button class="tl-page-arrow-btn" id="tl-page-btn-prev">◀</button>
-            <div class="tl-page-central-display">PAGE: ${displayIndex} / ${totalPages}</div>
-            <button class="tl-page-arrow-btn" id="tl-page-btn-next">▶</button>
-            <button class="tl-page-add-trigger" id="tl-page-btn-add">➕ 페이지 추가</button>
-            <button class="tl-page-del-trigger" id="tl-page-btn-del" title="현재 페이지 삭제">🗑</button>
-        `;
+    let pageTabsInitialized = false;
+    let pageCentralDisplay = null;
 
-        pageNavBar.querySelector('#tl-page-btn-prev').addEventListener('click', () => {
-            if (pageState.currentPageIdx > 0) { pageState.currentPageIdx--; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
-        });
-        pageNavBar.querySelector('#tl-page-btn-next').addEventListener('click', () => {
-            if (pageState.currentPageIdx < pageState.pages.length - 1) { pageState.currentPageIdx++; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
-        });
-        pageNavBar.querySelector('#tl-page-btn-add').addEventListener('click', () => {
-            const nextNum = pageState.pages.length + 1;
-            pageState.pages.push({ pageName: `댓글 ${nextNum}`, list: [] });
-            pageState.currentPageIdx = pageState.pages.length - 1;
-            currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
-        });
-        pageNavBar.querySelector('#tl-page-btn-del').addEventListener('click', () => {
-            if (pageState.pages.length <= 1) return; // 마지막 페이지는 삭제 불가
-            showConfirmPopup('현재 페이지를 삭제하시겠습니까?', () => {
-                pageState.pages.splice(pageState.currentPageIdx, 1);
-                if (pageState.currentPageIdx >= pageState.pages.length) pageState.currentPageIdx = pageState.pages.length - 1;
+    function renderPageTabs() {
+        if (!pageTabsInitialized) {
+            pageNavBar.innerHTML = `
+                <button class="tl-page-arrow-btn" id="tl-page-btn-prev">◀</button>
+                <div class="tl-page-central-display" id="tl-page-central"></div>
+                <button class="tl-page-arrow-btn" id="tl-page-btn-next">▶</button>
+                <button class="tl-page-add-trigger" id="tl-page-btn-add">➕ 페이지 추가</button>
+                <button class="tl-page-del-trigger" id="tl-page-btn-del" title="현재 페이지 삭제">🗑</button>
+            `;
+            pageCentralDisplay = pageNavBar.querySelector('#tl-page-central');
+
+            pageNavBar.querySelector('#tl-page-btn-prev').addEventListener('click', () => {
+                if (pageState.currentPageIdx > 0) { pageState.currentPageIdx--; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
+            });
+            pageNavBar.querySelector('#tl-page-btn-next').addEventListener('click', () => {
+                if (pageState.currentPageIdx < pageState.pages.length - 1) { pageState.currentPageIdx++; currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI(); }
+            });
+            pageNavBar.querySelector('#tl-page-btn-add').addEventListener('click', () => {
+                const nextNum = pageState.pages.length + 1;
+                pageState.pages.push({ pageName: `댓글 ${nextNum}`, list: [] });
+                pageState.currentPageIdx = pageState.pages.length - 1;
                 currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
             });
-        });
+            pageNavBar.querySelector('#tl-page-btn-del').addEventListener('click', () => {
+                if (pageState.pages.length <= 1) return;
+                showConfirmPopup('현재 페이지를 삭제하시겠습니까?', () => {
+                    pageState.pages.splice(pageState.currentPageIdx, 1);
+                    if (pageState.currentPageIdx >= pageState.pages.length) pageState.currentPageIdx = pageState.pages.length - 1;
+                    currentFocusedIdx = -1; savePageState(); render(); refreshToolbarUI();
+                });
+            });
+            pageTabsInitialized = true;
+        }
+
+        pageCentralDisplay.textContent = `PAGE: ${pageState.currentPageIdx + 1} / ${pageState.pages.length}`;
     }
 
     function refreshToolbarUI() {
@@ -670,7 +690,7 @@
         if (hasChecked) {
             const panelWrapper = document.createElement('div');
             panelWrapper.className = 'tl-time-panel-wrapper';
-            const toggleSelectText = isAllChecked ? '❌ 전체 해제' : '☑️ 현재페이지 전체선택';
+            const toggleSelectText = isAllChecked ? '❌ 전체 해제' : '☑️ 전체선택';
             const selectedItems = activeList.filter(item => item.selected);
             const allSelectedAreText = selectedItems.length > 0 && selectedItems.every(item => item.isText);
             const typeToggleLabel = allSelectedAreText ? '⏱ 타임라인으로 변경' : '📝 텍스트로 변경';
@@ -715,32 +735,61 @@
         const activeList = getActiveList();
 
         bodyContainer.innerHTML = '';
+        const fragment = document.createDocumentFragment();
+        const textareas = [];
+
         activeList.forEach((item, index) => {
             const row = document.createElement('div');
             const isFocused = (index === currentFocusedIdx);
             row.className = `tl-row tl-depth-${item.depth || 0} ${item.selected ? 'tl-selected' : ''} ${isFocused ? 'tl-focused' : ''}`;
             row.dataset.index = index;
-            
+
             const btnClass = isLiveMode ? 'tl-time-btn live-btn' : (item.isText ? 'tl-time-btn text-mode' : 'tl-time-btn');
             row.innerHTML = `
                 <input type="checkbox" class="tl-checkbox" ${item.selected ? 'checked' : ''}>
                 <button class="${btnClass}" data-time="${item.seconds}">${item.timeStr}</button>
-                <textarea class="tl-input" placeholder="내용 입력...">${item.text}</textarea>
+                <textarea class="tl-input" rows="1" placeholder="내용 입력...">${item.text}</textarea>
                 <button class="tl-del-btn">X</button>
             `;
-            bodyContainer.appendChild(row);
-            autoResizeTextarea(row.querySelector('.tl-input'));
+            fragment.appendChild(row);
+            textareas.push(row.querySelector('.tl-input'));
         });
+
+        bodyContainer.appendChild(fragment);
+
+        // 배치 read/write: N번 → 1번 레이아웃
+        textareas.forEach(ta => { ta.style.height = '0'; });
+        const heights = textareas.map(ta => ta.scrollHeight);
+        heights.forEach((h, i) => { textareas[i].style.height = h + 'px'; });
         
-        savePageState();
-        updateCounterUI();
+        debouncedSave();
+        debouncedUpdateCounter();
         bodyContainer.scrollTop = currentScrollPosition;
     }
 
     function modifyTimelineSeconds(delta) {
         const activeList = getActiveList();
-        activeList.forEach(item => { if (item.selected) { item.seconds = Math.max(0, (item.seconds || 0) + delta); item.timeStr = formatTime(item.seconds); } });
-        activeList.sort((a, b) => a.seconds - b.seconds); render();
+        const preOrder = activeList.map(item => item);
+
+        activeList.forEach(item => {
+            if (item.selected) { item.seconds = Math.max(0, (item.seconds || 0) + delta); item.timeStr = formatTime(item.seconds); }
+        });
+        activeList.sort((a, b) => a.seconds - b.seconds);
+
+        const orderChanged = preOrder.some((item, i) => activeList[i] !== item);
+
+        if (!orderChanged) {
+            activeList.forEach((item, i) => {
+                if (!item.selected) return;
+                const rowEl = bodyContainer.querySelector(`.tl-row[data-index="${i}"]`);
+                if (!rowEl) return;
+                const btn = rowEl.querySelector('.tl-time-btn');
+                if (btn) { btn.textContent = item.timeStr; btn.dataset.time = item.seconds; }
+            });
+            debouncedSave();
+        } else {
+            render();
+        }
     }
 
     function openHugeModifyModal() {
@@ -815,6 +864,47 @@
         }, 50);
     }
 
+    function addTextTimestamp() {
+        if (!activeVideo) return alert('재생 중인 영상을 찾을 수 없습니다.');
+
+        const metrics = calculateTextMetrics();
+        if (metrics.length >= 4950) {
+            const nextIndex = pageState.pages.length + 1;
+            pageState.pages.push({ pageName: `댓글 ${nextIndex}`, list: [] });
+            pageState.currentPageIdx = pageState.pages.length - 1;
+        }
+
+        let currentSec = activeVideo.currentTime + getCurrentPartOffset(); let timeStr = formatTime(currentSec);
+        if (isLiveMode) {
+            const liveTimeElement = document.getElementById('time');
+            if (liveTimeElement) {
+                const parts = liveTimeElement.innerText.trim().split(':');
+                if (parts.length === 3) {
+                    let extractedSec = (parseInt(parts[0], 10) * 3600) + (parseInt(parts[1], 10) * 60) + parseInt(parts[2], 10);
+                    currentSec = Math.max(0, extractedSec - liveOffsetSeconds); timeStr = formatTime(currentSec);
+                }
+            }
+        }
+
+        let defaultDepth = 0; const activeList = getActiveList();
+        try {
+            const tempArray = [...activeList, { seconds: currentSec }]; tempArray.sort((a, b) => a.seconds - b.seconds);
+            const virtualIdx = tempArray.findIndex(item => item.seconds === currentSec && !item.timeStr);
+            if (virtualIdx > 0) defaultDepth = tempArray[virtualIdx - 1].depth || 0;
+        } catch(e) {}
+
+        const virtualObject = { seconds: currentSec, timeStr: timeStr, text: '', depth: defaultDepth, selected: false, isText: true };
+        activeList.push(virtualObject); activeList.sort((a, b) => a.seconds - b.seconds);
+
+        const foundRealIdx = activeList.findIndex(item => item === virtualObject); currentFocusedIdx = foundRealIdx;
+        render(); refreshToolbarUI();
+
+        setTimeout(() => {
+            const rows = bodyContainer.querySelectorAll('.tl-row');
+            if (rows[foundRealIdx]) { rows[foundRealIdx].querySelector('.tl-input').focus(); rows[foundRealIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+        }, 50);
+    }
+
     // --- 6. 이벤트 통합 리스너 설계 레이어 ---
     dynamicToolbar.addEventListener('click', (e) => {
         if (!e.target.classList.contains('tl-emoji-btn')) return;
@@ -837,11 +927,24 @@
         const idx = parseInt(row.dataset.index); const activeList = getActiveList();
 
         if (e.target.classList.contains('tl-checkbox')) {
-            const targetChecked = e.target.checked; const parentDepth = activeList[idx].depth || 0; activeList[idx].selected = targetChecked;
-            for (let i = idx + 1; i < activeList.length; i++) { if ((activeList[i].depth || 0) > parentDepth) activeList[i].selected = targetChecked; else break; }
-            render(); refreshToolbarUI(); return;
+            const targetChecked = e.target.checked;
+            const parentDepth = activeList[idx].depth || 0;
+            activeList[idx].selected = targetChecked;
+            const affectedIndices = [idx];
+            for (let i = idx + 1; i < activeList.length; i++) {
+                if ((activeList[i].depth || 0) > parentDepth) { activeList[i].selected = targetChecked; affectedIndices.push(i); }
+                else break;
+            }
+            affectedIndices.forEach(i => {
+                const rowEl = bodyContainer.querySelector(`.tl-row[data-index="${i}"]`);
+                if (!rowEl) return;
+                rowEl.classList.toggle('tl-selected', targetChecked);
+                const cb = rowEl.querySelector('.tl-checkbox');
+                if (cb) cb.checked = targetChecked;
+            });
+            e.target.blur(); debouncedSave(); refreshToolbarUI(); return;
         }
-        if (e.target.classList.contains('tl-time-btn')) { seekToTime(parseFloat(e.target.dataset.time)); return; }
+        if (e.target.classList.contains('tl-time-btn')) { const t = parseFloat(e.target.dataset.time); if (t >= 0) seekToTime(t); return; }
         if (e.target.classList.contains('tl-del-btn')) { 
             activeList.splice(idx, 1); if(currentFocusedIdx === idx) currentFocusedIdx = -1; render(); refreshToolbarUI(); return; 
         }
@@ -859,7 +962,7 @@
     bodyContainer.addEventListener('input', (e) => {
         const row = e.target.closest('.tl-row');
         if (row && e.target.classList.contains('tl-input')) {
-            getActiveList()[parseInt(row.dataset.index)].text = e.target.value; savePageState(); autoResizeTextarea(e.target); updateCounterUI();
+            getActiveList()[parseInt(row.dataset.index)].text = e.target.value; debouncedSave(); autoResizeTextarea(e.target); debouncedUpdateCounter();
         }
     });
 
@@ -889,11 +992,20 @@
                 return;
             }
 
-            const matchAddKey = (e.key.toLowerCase() === hotkeys.addTimestamp.key.toLowerCase()) && 
-                                (e.ctrlKey === hotkeys.addTimestamp.ctrl) && (e.shiftKey === hotkeys.addTimestamp.shift) && 
+            const matchAddKey = (e.key.toLowerCase() === hotkeys.addTimestamp.key.toLowerCase()) &&
+                                (e.ctrlKey === hotkeys.addTimestamp.ctrl) && (e.shiftKey === hotkeys.addTimestamp.shift) &&
                                 (isMac ? (e.metaKey === hotkeys.addTimestamp.meta) : (e.altKey === hotkeys.addTimestamp.alt));
+            const matchAddTextKey = (e.key.toLowerCase() === hotkeys.addTextTimestamp.key.toLowerCase()) &&
+                                (e.ctrlKey === hotkeys.addTextTimestamp.ctrl) && (e.shiftKey === hotkeys.addTextTimestamp.shift) &&
+                                (isMac ? (e.metaKey === hotkeys.addTextTimestamp.meta) : (e.altKey === hotkeys.addTextTimestamp.alt));
 
             if (matchAddKey) {
+                e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
+                bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
+                e.target.blur(); if (activeVideo) activeVideo.focus();
+                checkAndOverflowPage(); return;
+            }
+            if (matchAddTextKey) {
                 e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
                 bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
                 e.target.blur(); if (activeVideo) activeVideo.focus();
@@ -925,6 +1037,7 @@
     document.getElementById('tl-btn-import').addEventListener('click', () => {
         const rawText = prompt('타임라인 텍스트를 붙여넣으세요 (현재 탭에 추가 정렬됩니다):'); if (!rawText) return;
         const lines = rawText.split('\n'); const imported = getActiveList();
+        const importStartIdx = imported.length; // 기존 항목과 병합되지 않도록 시작 인덱스 기록
         let lastSeconds = -1; // 임포트 내 마지막 아이템 시간 트래킹
         lines.forEach(line => {
             if (!line.trim()) return; // 빈 줄 무시
@@ -939,18 +1052,22 @@
                     depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0), selected: false
                 });
             } else {
-                // 타임라인 형식이 아님: 직전 시간 + 1초, 없으면 0초
-                const textSeconds = lastSeconds < 0 ? 0 : lastSeconds + 1;
-                lastSeconds = textSeconds;
-                const h = Math.floor(textSeconds / 3600), m = Math.floor((textSeconds % 3600) / 60), s = textSeconds % 60;
-                const timeStr = `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`.padStart(8, '0');
-                const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
-                imported.push({
-                    seconds: textSeconds, timeStr,
-                    text: line.replace(/^ㅤ*ㄴ*/, '').trim(),
-                    depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0),
-                    selected: false, isText: true
-                });
+                // 타임라인 형식이 아님: 직전 임포트 항목이 isText면 줄바꿈으로 병합
+                const lastItem = imported.length > importStartIdx ? imported[imported.length - 1] : null;
+                if (lastItem && lastItem.isText) {
+                    lastItem.text += '\n' + line.replace(/^ㅤ*ㄴ*/, '').trim();
+                } else {
+                    const textSeconds = lastSeconds < 0 ? -1 : lastSeconds + 1;
+                    if (textSeconds >= 0) lastSeconds = textSeconds;
+                    const timeStr = textSeconds < 0 ? '--:--:--' : (() => { const h = Math.floor(textSeconds / 3600), m = Math.floor((textSeconds % 3600) / 60), s = textSeconds % 60; return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`.padStart(8, '0'); })();
+                    const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
+                    imported.push({
+                        seconds: textSeconds, timeStr,
+                        text: line.replace(/^ㅤ*ㄴ*/, '').trim(),
+                        depth: Math.min(3, line.includes('ㄴ') ? 1 + leadSpaces : 0),
+                        selected: false, isText: true
+                    });
+                }
             }
         });
         if (imported.length > 0) { currentFocusedIdx = -1; pageState.pages[pageState.currentPageIdx].list = imported.sort((a, b) => a.seconds - b.seconds); render(); refreshToolbarUI(); }
@@ -1088,8 +1205,9 @@
         }
 
         if (isMatch(hotkeys.addTimestamp)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTimestamp(); } return; }
+        if (isMatch(hotkeys.addTextTimestamp)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTextTimestamp(); } return; }
 
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') { if (e.key === 'Escape' || e.keyCode === 27) { if (currentFocusedIdx !== -1) { e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); return; } } return; }
+        if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox')) { if (e.key === 'Escape' || e.keyCode === 27) { e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); checkAndOverflowPage(); return; } return; }
 
         if (isMatch(hotkeys.timeMinus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-1); return; }
         if (isMatch(hotkeys.timePlus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(1); return; }
