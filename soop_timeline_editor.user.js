@@ -1087,6 +1087,11 @@
             <div style="flex:1; overflow-y:auto; font-size:13px; color:#ddd; padding-right:4px;">
                 <table class="tl-help-table"><thead><tr><th>기능 종류</th><th>연동 단축키</th><th style="text-align:right;">편집</th></tr></thead><tbody id="tl-hotkey-table-body">${rowsHtml}</tbody></table>
                 <p style="margin-top:10px; font-size:12px; color:#00b074; font-weight:bold;">💡 [신규 전용 핫키] 작성 중인 타임라인 라인 즉시 삭제 파괴: <kbd class="tl-help-kbd">${mainModKeyText} + Backspace</kbd></p>
+                <table class="tl-help-table" style="margin-top:8px;"><thead><tr><th colspan="2">고정 단축키 (변경 불가)</th></tr></thead><tbody>
+                    <tr><td style="font-weight:600; color:#eee;">이전 페이지로 이동</td><td><kbd class="tl-help-kbd">${mainModKeyText} + ←</kbd></td></tr>
+                    <tr><td style="font-weight:600; color:#eee;">다음 페이지로 이동 / 새 페이지 생성</td><td><kbd class="tl-help-kbd">${mainModKeyText} + →</kbd></td></tr>
+                    <tr><td style="font-weight:600; color:#eee;">동영상 N초 앞/뒤로 탐색 (VOD)</td><td><kbd class="tl-help-kbd">Shift + ← / →</kbd></td></tr>
+                </tbody></table>
             </div>
             <div class="tl-modal-footer"><button class="tl-btn-main" id="tl-help-close-btn" style="padding: 8px 24px;">닫기</button></div>
         `;
