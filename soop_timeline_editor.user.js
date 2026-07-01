@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOOP 타임라인 에디터
 // @namespace    http://tampermonkey.net/
-// @version      9.20
+// @version      10.2
 // @description  5000자 기준 자동/수동 페이지 분할로 대용량 렉 전면 박멸, 입력 디바운스·rAF 드래그 성능 최적화, Cmd(Alt)+Backspace 즉시 삭제 및 스마트 단축키 커스텀 집대성 버전
 // @author       소해999
 // @match        https://vod.sooplive.com/player/*
@@ -17,7 +17,7 @@
 // @connect      api.m.sooplive.com
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     // --- 1. OS 및 현재 페이지 모드(VOD / LIVE) 판별 ---
@@ -40,9 +40,15 @@
 
     let hotkeys = GM_getValue('soop_global_hotkeys_v9_5', JSON.parse(JSON.stringify(defaultHotkeys)));
     if (!hotkeys.addTextTimestamp) hotkeys.addTextTimestamp = defaultHotkeys.addTextTimestamp;
+    // 보조 단축키: 기본(primary) 단축키는 고정하고, 이 목록의 키를 추가로 눌러도 동일 기능이 발동한다. tabDepth는 지원하지 않음.
+    const defaultSecondaryHotkeys = {
+        addTimestamp: { ctrl: false, alt: false, shift: false, meta: false, key: 'y', code: 'KeyY' },
+        addTextTimestamp: { ctrl: false, alt: false, shift: true, meta: false, key: 'Y', code: 'KeyY' }
+    };
+    let secondaryHotkeys = GM_getValue('soop_global_hotkeys_secondary_v1', JSON.parse(JSON.stringify(defaultSecondaryHotkeys)));
 
     // --- 3. 🌟 2차원 데이터 레이어 로드 및 구조 마이그레이션 가드 ---
-    let skipSeconds = GM_getValue('soop_global_skip_seconds', 5); 
+    let skipSeconds = GM_getValue('soop_global_skip_seconds', 5);
     let liveOffsetSeconds = GM_getValue('soop_global_live_offset', 0);
     const initialEmojiPreset = ["💜", "💛", "💙", "🩷", "🩵", "💚"];
     let customEmojis = GM_getValue('soop_global_custom_emojis', initialEmojiPreset);
@@ -116,6 +122,36 @@
         return parts.join(' + ');
     }
 
+    function isHotkeyMatch(hk, e) {
+        if (!hk) return false;
+        // 한/영 키 전환과 무관하게 매칭: code(물리적 키 위치)가 저장돼 있으면 우선 사용, 없으면 key로 폴백(구버전 저장 데이터 호환)
+        const keyMatches = hk.code ? (e.code === hk.code) : (e.key.toLowerCase() === hk.key.toLowerCase());
+        const basicMatch = keyMatches &&
+            (e.ctrlKey === hk.ctrl) && (e.shiftKey === hk.shift) &&
+            (isMac ? (e.metaKey === hk.meta) : (e.altKey === hk.alt));
+        if (!basicMatch) return false;
+        // Shift만으로는 실제 조합키로 보지 않음: Shift+문자키는 대문자 입력과 동일한 형태라 타이핑 보호 대상에 포함
+        const noRealMods = !hk.ctrl && !hk.alt && !hk.meta;
+        const isTextTarget = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+        const isPrintableChar = hk.code ? /^(Key|Digit)/.test(hk.code) : hk.key.length === 1;
+        if (noRealMods && isPrintableChar && isTextTarget) return false; // 입력창 타이핑 보호: 문자/숫자 키(+Shift)는 입력 중 무시
+        return true;
+    }
+
+    function matchesAction(actionKey, e) {
+        if (actionKey === 'tabDepth') return isHotkeyMatch(hotkeys[actionKey], e); // tabDepth는 보조 단축키 미지원
+        return isHotkeyMatch(hotkeys[actionKey], e) || isHotkeyMatch(secondaryHotkeys[actionKey], e);
+    }
+
+    function refreshSecondaryCell(actionKey) {
+        const kbd = document.getElementById(`kbd-text-secondary-${actionKey}`);
+        if (!kbd) return;
+        const hk = secondaryHotkeys[actionKey];
+        kbd.innerText = hk ? getHotkeyString(hk) : '미설정';
+        const clearBtn = document.querySelector(`.tl-kbd-btn-clear[data-action="${actionKey}"]`);
+        if (clearBtn) clearBtn.style.display = hk ? '' : 'none';
+    }
+
     function matchPartByDuration(dur) {
         if (!dur || isNaN(dur) || partDurations.length === 0) return;
         let bestIdx = 0, bestDiff = Infinity;
@@ -141,7 +177,7 @@
                     const d = vid.duration;
                     if (!d || !isFinite(d)) return;
                     vid.currentTime = d;
-                    if (vid.paused) vid.play().catch(() => {});
+                    if (vid.paused) vid.play().catch(() => { });
                 }
             }, 500);
         } else {
@@ -232,7 +268,7 @@
 
         // 2. 고정 셀렉터 후보 (div/span 기반 커스텀 시크바)
         const barSelectors = ['.vod-progress-bar', '.seekBar', '#seekBar', '.player-progress',
-                              '[class*="progressBar"]', '[class*="seekbar" i]', '[class*="seek-bar" i]'];
+            '[class*="progressBar"]', '[class*="seekbar" i]', '[class*="seek-bar" i]'];
         for (const sel of barSelectors) {
             const el = document.querySelector(sel);
             if (!el) continue;
@@ -263,7 +299,7 @@
         if (!d || !isFinite(d)) return;
         // duration 끝으로 seek → play() 호출 시 ended가 즉시 발생해 SOOP이 다음 파트 로드
         vid.currentTime = d;
-        if (vid.paused) vid.play().catch(() => {});
+        if (vid.paused) vid.play().catch(() => { });
     }
 
     function triggerPartReverse(vid, targetAbsSec) {
@@ -326,9 +362,9 @@
                         partOffsets = offsets;
                         partDurations = durations;
                     }
-                } catch(e) {}
+                } catch (e) { }
             },
-            onerror() {} // 18000초 폴백: 파트 전환 시 onLoadStart에서 자동 확장
+            onerror() { } // 18000초 폴백: 파트 전환 시 onLoadStart에서 자동 확장
         });
     }
 
@@ -339,7 +375,7 @@
             const currentDepth = item.depth || 0;
             const lines = item.text.split('\n');
             const prefix = currentDepth === 0 ? '' : 'ㅤ'.repeat(currentDepth - 1) + 'ㄴ';
-            
+
             return lines.map((line, idx) => {
                 if (idx === 0) return item.isText ? `${prefix}${line}` : `${prefix}${item.timeStr} ${line}`;
                 const fallbackSpace = currentDepth === 0 ? 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤ' : 'ㅤ'.repeat(currentDepth - 1) + 'ㅤㅤㅤㅤㅤㅤㅤㅤㅤㅤ';
@@ -370,7 +406,7 @@
         if (isMainSidebar) {
             targetElement.style.right = '20px'; targetElement.style.top = '100px'; targetElement.style.left = 'auto';
         } else {
-            const modalWidth = 420; const modalHeight = targetElement.offsetHeight || 320; 
+            const modalWidth = 420; const modalHeight = targetElement.offsetHeight || 320;
             targetElement.style.left = ((window.innerWidth - modalWidth) / 2) + 'px';
             targetElement.style.top = ((window.innerHeight - modalHeight) / 2) + 'px';
         }
@@ -501,6 +537,9 @@
         .tl-help-kbd { background: #4e4e56; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; box-shadow: 0 1px 2px rgba(0,0,0,0.4); margin-right: 2px; }
         .tl-kbd-btn-change { background: #00b074; color: white; border: none; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; float: right; }
         .tl-kbd-btn-change.recording { background: #e54444 !important; animation: tl-blink 1s infinite; }
+        .tl-hotkey-secondary-cell { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .tl-kbd-btn-clear { background: #4e4e56; color: white; border: none; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; }
+        #tl-help-modal { width: 520px !important; }
         @keyframes tl-blink { 50% { opacity: 0.5; } }
 
         .tl-modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; padding-top: 12px; border-top: 1px solid #3a3a44; }
@@ -578,7 +617,7 @@
         function confirm() { close(); onConfirm(); }
 
         function keyHandler(e) {
-            if (e.key === 'Enter')  { e.preventDefault(); e.stopImmediatePropagation(); confirm(); }
+            if (e.key === 'Enter') { e.preventDefault(); e.stopImmediatePropagation(); confirm(); }
             if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); }
         }
         modal.querySelector('#tl-confirm-yes').addEventListener('click', confirm);
@@ -761,7 +800,7 @@
         textareas.forEach(ta => { ta.style.height = '0'; });
         const heights = textareas.map(ta => ta.scrollHeight);
         heights.forEach((h, i) => { textareas[i].style.height = h + 'px'; });
-        
+
         debouncedSave();
         debouncedUpdateCounter();
         bodyContainer.scrollTop = currentScrollPosition;
@@ -794,7 +833,7 @@
 
     function openHugeModifyModal() {
         const activeList = getActiveList();
-        const checkedCount = activeList.filter(item => item.selected).length; if(checkedCount === 0) return;
+        const checkedCount = activeList.filter(item => item.selected).length; if (checkedCount === 0) return;
         const mask = document.createElement('div'); mask.className = 'tl-modal-mask';
         const modal = document.createElement('div'); modal.className = 'tledit-popup-box';
         modal.innerHTML = `
@@ -824,7 +863,7 @@
 
     function addTimestamp() {
         if (!activeVideo) return alert('재생 중인 영상을 찾을 수 없습니다.');
-        
+
         // 🌟 성능 증폭 가드: 만약 현재 페이지가 이미 5000 임계점을 돌파해 있다면 강제로 새 자동 페이지를 개설해 파킹
         const metrics = calculateTextMetrics();
         if (metrics.length >= 4950) {
@@ -850,12 +889,12 @@
             const tempArray = [...activeList, { seconds: currentSec }]; tempArray.sort((a, b) => a.seconds - b.seconds);
             const virtualIdx = tempArray.findIndex(item => item.seconds === currentSec && !item.timeStr);
             if (virtualIdx > 0) defaultDepth = tempArray[virtualIdx - 1].depth || 0;
-        } catch(e) {}
+        } catch (e) { }
 
         const virtualObject = { seconds: currentSec, timeStr: timeStr, text: '', depth: defaultDepth, selected: false };
-        activeList.push(virtualObject); activeList.sort((a, b) => a.seconds - b.seconds); 
+        activeList.push(virtualObject); activeList.sort((a, b) => a.seconds - b.seconds);
 
-        const foundRealIdx = activeList.findIndex(item => item === virtualObject); currentFocusedIdx = foundRealIdx; 
+        const foundRealIdx = activeList.findIndex(item => item === virtualObject); currentFocusedIdx = foundRealIdx;
         render(); refreshToolbarUI();
 
         setTimeout(() => {
@@ -891,7 +930,7 @@
             const tempArray = [...activeList, { seconds: currentSec }]; tempArray.sort((a, b) => a.seconds - b.seconds);
             const virtualIdx = tempArray.findIndex(item => item.seconds === currentSec && !item.timeStr);
             if (virtualIdx > 0) defaultDepth = tempArray[virtualIdx - 1].depth || 0;
-        } catch(e) {}
+        } catch (e) { }
 
         const virtualObject = { seconds: currentSec, timeStr: timeStr, text: '', depth: defaultDepth, selected: false, isText: true };
         activeList.push(virtualObject); activeList.sort((a, b) => a.seconds - b.seconds);
@@ -945,8 +984,8 @@
             e.target.blur(); debouncedSave(); refreshToolbarUI(); return;
         }
         if (e.target.classList.contains('tl-time-btn')) { const t = parseFloat(e.target.dataset.time); if (t >= 0) seekToTime(t); return; }
-        if (e.target.classList.contains('tl-del-btn')) { 
-            activeList.splice(idx, 1); if(currentFocusedIdx === idx) currentFocusedIdx = -1; render(); refreshToolbarUI(); return; 
+        if (e.target.classList.contains('tl-del-btn')) {
+            activeList.splice(idx, 1); if (currentFocusedIdx === idx) currentFocusedIdx = -1; render(); refreshToolbarUI(); return;
         }
     });
 
@@ -982,7 +1021,7 @@
 
         if (e.target.classList.contains('tl-input')) {
             const isMainModifier = isMac ? (e.metaKey || e.keyCode === 91 || e.keyCode === 93) : e.altKey;
-            
+
             // 🌟 대망의 추가 요청 반영: 수정 단계창 내부에서 Cmd(Alt) + Backspace(지우기) 클릭 시 원터치 파괴폭파 기능 가동
             if (isMainModifier && (e.key === 'Backspace' || e.keyCode === 8)) {
                 e.preventDefault(); e.stopPropagation();
@@ -992,12 +1031,8 @@
                 return;
             }
 
-            const matchAddKey = (e.key.toLowerCase() === hotkeys.addTimestamp.key.toLowerCase()) &&
-                                (e.ctrlKey === hotkeys.addTimestamp.ctrl) && (e.shiftKey === hotkeys.addTimestamp.shift) &&
-                                (isMac ? (e.metaKey === hotkeys.addTimestamp.meta) : (e.altKey === hotkeys.addTimestamp.alt));
-            const matchAddTextKey = (e.key.toLowerCase() === hotkeys.addTextTimestamp.key.toLowerCase()) &&
-                                (e.ctrlKey === hotkeys.addTextTimestamp.ctrl) && (e.shiftKey === hotkeys.addTextTimestamp.shift) &&
-                                (isMac ? (e.metaKey === hotkeys.addTextTimestamp.meta) : (e.altKey === hotkeys.addTextTimestamp.alt));
+            const matchAddKey = matchesAction('addTimestamp', e);
+            const matchAddTextKey = matchesAction('addTextTimestamp', e);
 
             if (matchAddKey) {
                 e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1;
@@ -1018,14 +1053,14 @@
                 e.target.blur(); if (activeVideo) activeVideo.focus();
                 checkAndOverflowPage(); return;
             }
-            e.stopPropagation(); 
+            e.stopPropagation();
         }
     });
 
     document.getElementById('tl-btn-clear').addEventListener('click', () => {
         const activeList = getActiveList(); if (activeList.length === 0) return alert('삭제할 데이터가 없습니다.');
-        if (confirm(`⚠️ 현재 페이지(${pageState.currentPageIdx + 1}번 탭)의 타임라인 데이터만 삭제됩니다. 정말 삭제하시겠습니까?`)) { 
-            pageState.pages[pageState.currentPageIdx].list = []; currentFocusedIdx = -1; render(); refreshToolbarUI(); 
+        if (confirm(`⚠️ 현재 페이지(${pageState.currentPageIdx + 1}번 탭)의 타임라인 데이터만 삭제됩니다. 정말 삭제하시겠습니까?`)) {
+            pageState.pages[pageState.currentPageIdx].list = []; currentFocusedIdx = -1; render(); refreshToolbarUI();
         }
     });
 
@@ -1043,7 +1078,7 @@
             if (!line.trim()) return; // 빈 줄 무시
             const match = line.match(/(?:(\d{1,2}):)?(\d{2}):(\d{2})/);
             if (match) {
-                const timeStr = match[0]; const totalSeconds = (match[1] ? parseInt(match[1])*3600 : 0) + parseInt(match[2])*60 + parseInt(match[3]);
+                const timeStr = match[0]; const totalSeconds = (match[1] ? parseInt(match[1]) * 3600 : 0) + parseInt(match[2]) * 60 + parseInt(match[3]);
                 const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
                 lastSeconds = totalSeconds;
                 imported.push({
@@ -1059,7 +1094,7 @@
                 } else {
                     const textSeconds = lastSeconds < 0 ? -1 : lastSeconds + 1;
                     if (textSeconds >= 0) lastSeconds = textSeconds;
-                    const timeStr = textSeconds < 0 ? '--:--:--' : (() => { const h = Math.floor(textSeconds / 3600), m = Math.floor((textSeconds % 3600) / 60), s = textSeconds % 60; return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`.padStart(8, '0'); })();
+                    const timeStr = textSeconds < 0 ? '--:--:--' : (() => { const h = Math.floor(textSeconds / 3600), m = Math.floor((textSeconds % 3600) / 60), s = textSeconds % 60; return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`.padStart(8, '0'); })();
                     const spaceMatch = line.match(/^(ㅤ*)/), leadSpaces = spaceMatch ? spaceMatch[1].length : 0;
                     imported.push({
                         seconds: textSeconds, timeStr,
@@ -1079,18 +1114,22 @@
         const modal = document.createElement('div'); modal.className = 'tledit-popup-box'; modal.id = 'tl-help-modal';
         let rowsHtml = '';
         for (const actionKey in hotkeys) {
-            const action = hotkeys[actionKey]; const currentKeyStr = getHotkeyString(action);
-            rowsHtml += `<tr data-action="${actionKey}"><td style="font-weight:600; color:#eee;">${action.label}</td><td><kbd class="tl-help-kbd" id="kbd-text-${actionKey}">${currentKeyStr}</kbd></td><td style="text-align:right;"><button class="tl-kbd-btn-change" data-action="${actionKey}">[ 변경 ]</button></td></tr>`;
+            if (actionKey === 'tabDepth') continue; // 보조 단축키 미지원: 아래 고정 단축키 표에 별도 표기
+            const action = hotkeys[actionKey]; const primaryKeyStr = getHotkeyString(action);
+            const secondary = secondaryHotkeys[actionKey];
+            rowsHtml += `<tr data-action="${actionKey}"><td style="font-weight:600; color:#eee;">${action.label}</td><td><kbd class="tl-help-kbd">${primaryKeyStr}</kbd></td><td><div class="tl-hotkey-secondary-cell"><kbd class="tl-help-kbd" id="kbd-text-secondary-${actionKey}">${secondary ? getHotkeyString(secondary) : '미설정'}</kbd><button class="tl-kbd-btn-change" data-action="${actionKey}">[ 추가/변경 ]</button><button class="tl-kbd-btn-clear" data-action="${actionKey}" style="${secondary ? '' : 'display:none;'}">[ 해제 ]</button></div></td></tr>`;
         }
         modal.innerHTML = `
-            <div class="tledit-popup-header-area"><span class="tledit-popup-title-text" style="width:60%;">❓ 단축키 커스텀 & 가이드</span><button class="tl-btn-sub" id="tl-kbd-btn-reset" style="padding: 4px 10px; font-size:11px; float:right;">🔄 전체 기본값 복원</button></div>
+            <div class="tledit-popup-header-area"><span class="tledit-popup-title-text" style="width:60%;">❓ 단축키 커스텀 & 가이드</span><button class="tl-btn-sub" id="tl-kbd-btn-reset" style="padding: 4px 10px; font-size:11px; float:right;">🔄 보조 단축키 전체 초기화</button></div>
             <div style="flex:1; overflow-y:auto; font-size:13px; color:#ddd; padding-right:4px;">
-                <table class="tl-help-table"><thead><tr><th>기능 종류</th><th>연동 단축키</th><th style="text-align:right;">편집</th></tr></thead><tbody id="tl-hotkey-table-body">${rowsHtml}</tbody></table>
-                <p style="margin-top:10px; font-size:12px; color:#00b074; font-weight:bold;">💡 [신규 전용 핫키] 작성 중인 타임라인 라인 즉시 삭제 파괴: <kbd class="tl-help-kbd">${mainModKeyText} + Backspace</kbd></p>
+                <p style="margin:0 0 6px; font-size:11px; color:#999;">기본 단축키는 고정입니다. 보조 단축키를 추가로 등록하면 둘 중 어느 키를 눌러도 동일하게 동작합니다.</p>
+                <table class="tl-help-table"><thead><tr><th>기능 종류</th><th>기본 단축키</th><th>보조 단축키</th></tr></thead><tbody id="tl-hotkey-table-body">${rowsHtml}</tbody></table>
                 <table class="tl-help-table" style="margin-top:8px;"><thead><tr><th colspan="2">고정 단축키 (변경 불가)</th></tr></thead><tbody>
                     <tr><td style="font-weight:600; color:#eee;">이전 페이지로 이동</td><td><kbd class="tl-help-kbd">${mainModKeyText} + ←</kbd></td></tr>
                     <tr><td style="font-weight:600; color:#eee;">다음 페이지로 이동 / 새 페이지 생성</td><td><kbd class="tl-help-kbd">${mainModKeyText} + →</kbd></td></tr>
                     <tr><td style="font-weight:600; color:#eee;">동영상 N초 앞/뒤로 탐색 (VOD)</td><td><kbd class="tl-help-kbd">Shift + ← / →</kbd></td></tr>
+                    <tr><td style="font-weight:600; color:#eee;">${hotkeys.tabDepth.label}</td><td><kbd class="tl-help-kbd">${getHotkeyString(hotkeys.tabDepth)}</kbd></td></tr>
+                    <tr><td style="font-weight:600; color:#eee;">작성 중인 타임라인 라인 즉시 삭제 파괴</td><td><kbd class="tl-help-kbd">${mainModKeyText} + Backspace</kbd></td></tr>
                 </tbody></table>
             </div>
             <div class="tl-modal-footer"><button class="tl-btn-main" id="tl-help-close-btn" style="padding: 8px 24px;">닫기</button></div>
@@ -1099,14 +1138,18 @@
         const cleanUpHelp = () => { recordingHotkeyAction = null; mask.remove(); modal.remove(); };
         modal.querySelector('#tl-help-close-btn').addEventListener('click', cleanUpHelp);
         modal.querySelector('#tl-kbd-btn-reset').addEventListener('click', () => {
-            if(confirm('⚠️ 모든 커스텀 설정을 초기 스펙 상태로 되돌리시겠습니까?')) { hotkeys = JSON.parse(JSON.stringify(defaultHotkeys)); GM_setValue('soop_global_hotkeys_v9_5', hotkeys); cleanUpHelp(); openHelpAndHotkeyModal(); }
+            if (confirm('⚠️ 등록된 보조 단축키를 모두 초기화하시겠습니까? (기본 단축키는 영향 없음)')) { secondaryHotkeys = {}; GM_setValue('soop_global_hotkeys_secondary_v1', secondaryHotkeys); cleanUpHelp(); openHelpAndHotkeyModal(); }
         });
         modal.querySelector('#tl-hotkey-table-body').addEventListener('click', (e) => {
-            if (!e.target.classList.contains('tl-kbd-btn-change')) return; const targetAction = e.target.dataset.action;
-            if (recordingHotkeyAction === targetAction) { recordingHotkeyAction = null; e.target.innerText = '[ 변경 ]'; e.target.classList.remove('recording'); document.getElementById(`kbd-text-${targetAction}`).innerText = getHotkeyString(hotkeys[targetAction]); return; }
-            modal.querySelectorAll('.tl-kbd-btn-change').forEach(btn => { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); });
-            for (const act in hotkeys) { document.getElementById(`kbd-text-${act}`).innerText = getHotkeyString(hotkeys[act]); }
-            recordingHotkeyAction = targetAction; e.target.innerText = '[ 입력중... ]'; e.target.classList.add('recording'); document.getElementById(`kbd-text-${targetAction}`).innerText = '⌨️ 키를 누르세요...';
+            const targetAction = e.target.dataset.action;
+            if (e.target.classList.contains('tl-kbd-btn-clear')) {
+                delete secondaryHotkeys[targetAction]; GM_setValue('soop_global_hotkeys_secondary_v1', secondaryHotkeys); refreshSecondaryCell(targetAction); return;
+            }
+            if (!e.target.classList.contains('tl-kbd-btn-change')) return;
+            if (recordingHotkeyAction === targetAction) { recordingHotkeyAction = null; e.target.innerText = '[ 추가/변경 ]'; e.target.classList.remove('recording'); refreshSecondaryCell(targetAction); return; }
+            modal.querySelectorAll('.tl-kbd-btn-change').forEach(btn => { btn.innerText = '[ 추가/변경 ]'; btn.classList.remove('recording'); });
+            for (const act in secondaryHotkeys) { refreshSecondaryCell(act); }
+            recordingHotkeyAction = targetAction; e.target.innerText = '[ 입력중... ]'; e.target.classList.add('recording'); document.getElementById(`kbd-text-secondary-${targetAction}`).innerText = '⌨️ 키를 누르세요...';
         });
     }
 
@@ -1160,22 +1203,20 @@
             e.preventDefault(); e.stopPropagation();
             if (e.key === 'Escape') {
                 const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${recordingHotkeyAction}"]`);
-                if (btn) { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); }
-                document.getElementById(`kbd-text-${recordingHotkeyAction}`).innerText = getHotkeyString(hotkeys[recordingHotkeyAction]);
+                if (btn) { btn.innerText = '[ 추가/변경 ]'; btn.classList.remove('recording'); }
+                const existingSecondary = secondaryHotkeys[recordingHotkeyAction];
+                document.getElementById(`kbd-text-secondary-${recordingHotkeyAction}`).innerText = existingSecondary ? getHotkeyString(existingSecondary) : '미설정';
                 recordingHotkeyAction = null; return;
             }
             if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
                 let tempParts = []; if (e.ctrlKey) tempParts.push('Ctrl'); if (e.altKey) tempParts.push('Alt'); if (e.shiftKey) tempParts.push('Shift'); if (e.metaKey) tempParts.push(isMac ? 'Cmd' : 'Win');
-                document.getElementById(`kbd-text-${recordingHotkeyAction}`).innerText = tempParts.join(' + ') + ' + ...'; return;
+                document.getElementById(`kbd-text-secondary-${recordingHotkeyAction}`).innerText = tempParts.join(' + ') + ' + ...'; return;
             }
-            const isSingleSymbolKey = /^[^a-zA-Z0-9]$/.test(e.key);
-            if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
-                if (recordingHotkeyAction === 'tabDepth' && e.key === 'Tab') {} else if (isSingleSymbolKey) {} else { alert('⚠️ 문자와 방향키, 엔터 등은 숲 단축키 보호를 위해 조합키(Ctrl, Alt, Shift)와 함께 눌러주세요!'); return; }
-            }
-            hotkeys[recordingHotkeyAction] = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key, label: defaultHotkeys[recordingHotkeyAction].label };
-            GM_setValue('soop_global_hotkeys_v9_5', hotkeys); const targetActSaved = recordingHotkeyAction; recordingHotkeyAction = null;
-            const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${targetActSaved}"]`); if (btn) { btn.innerText = '[ 변경 ]'; btn.classList.remove('recording'); }
-            document.getElementById(`kbd-text-${targetActSaved}`).innerText = getHotkeyString(hotkeys[targetActSaved]); return;
+            // 보조 단축키는 조합키 없는 단독 키(문자, 숫자 포함)도 제한 없이 허용
+            secondaryHotkeys[recordingHotkeyAction] = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key, code: e.code };
+            GM_setValue('soop_global_hotkeys_secondary_v1', secondaryHotkeys); const targetActSaved = recordingHotkeyAction; recordingHotkeyAction = null;
+            const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${targetActSaved}"]`); if (btn) { btn.innerText = '[ 추가/변경 ]'; btn.classList.remove('recording'); }
+            refreshSecondaryCell(targetActSaved); return;
         }
 
         const isMainModifier = isMac ? (e.metaKey || e.keyCode === 91 || e.keyCode === 93) : e.altKey;
@@ -1193,15 +1234,13 @@
 
         if (document.getElementById('tl-sett-modal') || document.getElementById('tl-huge-modal') || document.getElementById('tl-confirm-modal') || document.getElementById('tl-notice-modal')) return;
 
-        const isMatch = (hk) => { return (e.key.toLowerCase() === hk.key.toLowerCase()) && (e.ctrlKey === hk.ctrl) && (e.shiftKey === hk.shift) && (isMac ? (e.metaKey === hk.meta) : (e.altKey === hk.alt)); };
-
         if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
-            if (isMatch(hotkeys.scrollTop)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: 0, behavior: 'smooth' }); return; }
-            if (isMatch(hotkeys.scrollBottom)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: bodyContainer.scrollHeight, behavior: 'smooth' }); return; }
+            if (matchesAction('scrollTop', e)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+            if (matchesAction('scrollBottom', e)) { e.preventDefault(); e.stopPropagation(); bodyContainer.scrollTo({ top: bodyContainer.scrollHeight, behavior: 'smooth' }); return; }
         }
 
         const isInputFocused = e.target.classList.contains('tl-input'); const activeList = getActiveList();
-        if (isMatch(hotkeys.tabDepth) && isInputFocused) {
+        if (matchesAction('tabDepth', e) && isInputFocused) {
             e.preventDefault(); e.stopPropagation(); const currentIdx = parseInt(e.target.closest('.tl-row').dataset.index); let targetIndices = activeList.map((item, idx) => item.selected ? idx : -1).filter(idx => idx !== -1);
             if (targetIndices.length === 0) targetIndices = [currentIdx];
             targetIndices.forEach(idx => { let d = activeList[idx].depth || 0; activeList[idx].depth = e.shiftKey ? Math.max(0, d - 1) : Math.min(3, d + 1); });
@@ -1209,15 +1248,15 @@
             tInput.focus(); tInput.value = val; tInput.setSelectionRange(cursor, cursor); return;
         }
 
-        if (isMatch(hotkeys.addTimestamp)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTimestamp(); } return; }
-        if (isMatch(hotkeys.addTextTimestamp)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTextTimestamp(); } return; }
+        if (matchesAction('addTimestamp', e)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTimestamp(); } return; }
+        if (matchesAction('addTextTimestamp', e)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTextTimestamp(); } return; }
 
         if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox')) { if (e.key === 'Escape' || e.keyCode === 27) { e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); checkAndOverflowPage(); return; } return; }
 
-        if (isMatch(hotkeys.timeMinus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-1); return; }
-        if (isMatch(hotkeys.timePlus1)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(1); return; }
-        if (isMatch(hotkeys.timeMinus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-5); return; }
-        if (isMatch(hotkeys.timePlus5)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(5); return; }
+        if (matchesAction('timeMinus1', e)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-1); return; }
+        if (matchesAction('timePlus1', e)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(1); return; }
+        if (matchesAction('timeMinus5', e)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(-5); return; }
+        if (matchesAction('timePlus5', e)) { e.preventDefault(); e.stopPropagation(); modifyTimelineSeconds(5); return; }
 
         if (isMainModifier && e.key === 'ArrowLeft') {
             e.preventDefault(); e.stopPropagation();
@@ -1241,7 +1280,7 @@
 
         if (e.key === 'ArrowLeft' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(getCurrentPartOffset() + Math.max(0, activeVideo.currentTime - skipSeconds)); return; }
         if (e.key === 'ArrowRight' && e.shiftKey) { e.preventDefault(); e.stopPropagation(); if (!isLiveMode && activeVideo) seekToTime(getCurrentPartOffset() + Math.min(activeVideo.duration, activeVideo.currentTime + skipSeconds)); return; }
-    }, true); 
+    }, true);
 
     initVideoFinder(); initPartOffsets(); refreshToolbarUI(); render();
 
