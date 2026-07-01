@@ -73,6 +73,7 @@
     let lastFocusedInput = null;
     let currentFocusedIdx = -1;
     let recordingHotkeyAction = null;
+    let lastPlainEnterTime = 0; // 타임스탬프 완료: 조합키 없는 Enter를 빠르게 두 번 누르면 완료 처리 (고정 동작, 단축키 커스텀 대상 아님)
 
     // --- 파트 오프셋 상태 ---
     let partOffsets = [0];
@@ -1130,6 +1131,7 @@
                     <tr><td style="font-weight:600; color:#eee;">동영상 N초 앞/뒤로 탐색 (VOD)</td><td><kbd class="tl-help-kbd">Shift + ← / →</kbd></td></tr>
                     <tr><td style="font-weight:600; color:#eee;">${hotkeys.tabDepth.label}</td><td><kbd class="tl-help-kbd">${getHotkeyString(hotkeys.tabDepth)}</kbd></td></tr>
                     <tr><td style="font-weight:600; color:#eee;">작성 중인 타임라인 라인 즉시 삭제 파괴</td><td><kbd class="tl-help-kbd">${mainModKeyText} + Backspace</kbd></td></tr>
+                    <tr><td style="font-weight:600; color:#eee;">작성 중 빠르게 두 번 눌러 완료</td><td><kbd class="tl-help-kbd">Enter</kbd> x2</td></tr>
                 </tbody></table>
             </div>
             <div class="tl-modal-footer"><button class="tl-btn-main" id="tl-help-close-btn" style="padding: 8px 24px;">닫기</button></div>
@@ -1250,6 +1252,23 @@
 
         if (matchesAction('addTimestamp', e)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTimestamp(); } return; }
         if (matchesAction('addTextTimestamp', e)) { e.preventDefault(); e.stopPropagation(); if (isInputFocused) { currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); } else { addTextTimestamp(); } return; }
+
+        // 타임스탬프 완료 전용 고정 동작(보조 단축키 미지원): 입력창에서 조합키 없는 Enter를 빠르게 두 번 누르면 완료 처리
+        if (isInputFocused && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+            const now = Date.now();
+            if (now - lastPlainEnterTime < 400) {
+                e.preventDefault(); e.stopPropagation(); lastPlainEnterTime = 0;
+                if (e.target.value.endsWith('\n')) {
+                    e.target.value = e.target.value.replace(/\n$/, '');
+                    const row = e.target.closest('.tl-row'); const idx = row ? parseInt(row.dataset.index) : -1;
+                    const item = getActiveList()[idx];
+                    if (item) { item.text = e.target.value; debouncedSave(); }
+                }
+                currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused'));
+                e.target.blur(); if (activeVideo) activeVideo.focus(); checkAndOverflowPage(); return;
+            }
+            lastPlainEnterTime = now;
+        }
 
         if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox')) { if (e.key === 'Escape' || e.keyCode === 27) { e.preventDefault(); e.stopPropagation(); currentFocusedIdx = -1; bodyContainer.querySelectorAll('.tl-row').forEach(r => r.classList.remove('tl-focused')); e.target.blur(); if (activeVideo) activeVideo.focus(); checkAndOverflowPage(); return; } return; }
 
