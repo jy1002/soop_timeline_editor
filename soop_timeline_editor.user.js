@@ -139,6 +139,12 @@
         return true;
     }
 
+    function isPlainTextSecondaryKey(hk) {
+        const noMods = !hk.ctrl && !hk.alt && !hk.shift && !hk.meta;
+        const isPrintableChar = hk.code ? /^(Key|Digit)/.test(hk.code) : hk.key.length === 1;
+        return noMods && isPrintableChar;
+    }
+
     function matchesAction(actionKey, e) {
         if (actionKey === 'tabDepth') return isHotkeyMatch(hotkeys[actionKey], e); // tabDepth는 보조 단축키 미지원
         return isHotkeyMatch(hotkeys[actionKey], e) || isHotkeyMatch(secondaryHotkeys[actionKey], e);
@@ -630,7 +636,7 @@
         modal.querySelector('#tl-confirm-yes').focus();
     }
 
-    function showNoticePopup(message) {
+    function showNoticePopup(message, dismissOnAnyKey) {
         document.getElementById('tl-notice-mask')?.remove();
         document.getElementById('tl-notice-modal')?.remove();
         const mask = document.createElement('div');
@@ -641,16 +647,16 @@
         Object.assign(modal.style, {
             position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
             background: '#222', color: '#fff', borderRadius: '8px', padding: '20px 24px',
-            zIndex: '2147483646', minWidth: '240px', textAlign: 'center', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+            zIndex: '2147483646', minWidth: '240px', maxWidth: '360px', textAlign: 'center', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
             fontFamily: 'sans-serif', fontSize: '14px'
         });
         modal.innerHTML = `
-            <div style="margin-bottom:10px;font-size:15px;">${message}</div>
-            <div style="color:#aaa;font-size:12px;margin-bottom:14px;">Enter 또는 Esc로 닫기</div>
+            <div style="margin-bottom:10px;font-size:15px; white-space:pre-line;">${message}</div>
+            <div style="color:#aaa;font-size:12px;margin-bottom:14px;">${dismissOnAnyKey ? '아무 키나 누르면 닫힙니다' : 'Enter 또는 Esc로 닫기'}</div>
             <button id="tl-notice-close" style="padding:6px 18px;background:#4a9eff;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">확인</button>
         `;
         function close() { mask.remove(); modal.remove(); window.removeEventListener('keydown', kh, true); }
-        function kh(e) { if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); } }
+        function kh(e) { if (dismissOnAnyKey || e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); } }
         modal.querySelector('#tl-notice-close').addEventListener('click', close);
         mask.addEventListener('click', close);
         window.addEventListener('keydown', kh, true);
@@ -1215,10 +1221,15 @@
                 document.getElementById(`kbd-text-secondary-${recordingHotkeyAction}`).innerText = tempParts.join(' + ') + ' + ...'; return;
             }
             // 보조 단축키는 조합키 없는 단독 키(문자, 숫자 포함)도 제한 없이 허용
-            secondaryHotkeys[recordingHotkeyAction] = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key, code: e.code };
+            const newSecondaryHk = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key: e.key, code: e.code };
+            secondaryHotkeys[recordingHotkeyAction] = newSecondaryHk;
             GM_setValue('soop_global_hotkeys_secondary_v1', secondaryHotkeys); const targetActSaved = recordingHotkeyAction; recordingHotkeyAction = null;
             const btn = document.querySelector(`.tl-kbd-btn-change[data-action="${targetActSaved}"]`); if (btn) { btn.innerText = '[ 추가/변경 ]'; btn.classList.remove('recording'); }
-            refreshSecondaryCell(targetActSaved); return;
+            refreshSecondaryCell(targetActSaved);
+            if (isPlainTextSecondaryKey(newSecondaryHk)) {
+                showNoticePopup('특정 단축키의 경우, SOOP 자체 혹은 브라우저 자체 단축키와 겹칠 수 있습니다.\n오류가 발생할 경우 해당 단축키를 초기화해주세요.\nex) F > 숲 자체 전체화면 단축키, M > 숲 자체 음소거 단축키 등', true);
+            }
+            return;
         }
 
         const isMainModifier = isMac ? (e.metaKey || e.keyCode === 91 || e.keyCode === 93) : e.altKey;

@@ -16,6 +16,13 @@ def get_rows(page: Page):
     return page.locator(".tl-row")
 
 
+def dismiss_collision_notice(page: Page):
+    """일반 텍스트 단일 키를 보조 단축키로 등록하면 뜨는 충돌 안내 팝업을 닫는다."""
+    page.locator("#tl-notice-modal").wait_for(state="visible", timeout=2000)
+    page.click("#tl-notice-close")
+    page.locator("#tl-notice-modal").wait_for(state="detached", timeout=2000)
+
+
 def test_help_modal_has_primary_and_secondary_columns(clean_page: Page):
     open_help_modal(clean_page)
     headers = clean_page.locator("#tl-help-modal table.tl-help-table").first.locator("th").all_inner_texts()
@@ -66,6 +73,7 @@ def test_secondary_key_fires_outside_input_but_not_inside(clean_page: Page):
     row.locator(".tl-kbd-btn-change").click()
     clean_page.wait_for_timeout(100)
     clean_page.keyboard.press("y")
+    dismiss_collision_notice(clean_page)
     clean_page.click("#tl-help-close-btn")
     clean_page.wait_for_timeout(100)
 
@@ -93,6 +101,7 @@ def test_clear_secondary_button(clean_page: Page):
     row.locator(".tl-kbd-btn-change").click()
     clean_page.wait_for_timeout(100)
     clean_page.keyboard.press("p")
+    dismiss_collision_notice(clean_page)
 
     clear_btn = row.locator(".tl-kbd-btn-clear")
     expect(clear_btn).to_be_visible()
@@ -113,6 +122,7 @@ def test_reset_all_secondary_button(clean_page: Page):
     row.locator(".tl-kbd-btn-change").click()
     clean_page.wait_for_timeout(100)
     clean_page.keyboard.press("g")
+    dismiss_collision_notice(clean_page)
 
     store = clean_page.evaluate("window.__GM_getStore()")
     assert store["soop_global_hotkeys_secondary_v1"]["scrollTop"]["key"] == "g"
